@@ -1,0 +1,102 @@
+{
+  "app_version": "v1",
+  "source_key": "bmce",
+  "symbols": [
+    "atw",
+    "tgc",
+    "msa",
+    "adi",
+    "adh",
+    "akt",
+    "jet",
+    "sgtm",
+    "bcp",
+    "SNA",
+    "CSR",
+    "cfg",
+    "cdm",
+    "vcn",
+    "cap",
+    "lhm"
+  ],
+  "data": {
+    "start": "2023-01-01",
+    "end": null,
+    "include_windows": null,
+    "exclude_windows": null,
+    "interval": "1d",
+    "yf_period": "None",
+    "yf_interval": "None",
+    "yf_auto_adjust": false
+  },
+  "optimization": {
+    "rank_metric": "CAGR",
+    "kinds": [
+      "buy_hold",
+      "sma_price",
+      "rsi",
+      "macd",
+      "bollinger"
+    ],
+    "method": "grid",
+    "n_trials": 0,
+    "top_k": 30,
+    "domains_by_kind": {
+      "sma_price": [
+        "strategy.sma_window",
+        "portfolio.cooldown_bars",
+        "portfolio.buy_pct_cash",
+        "portfolio.sell_pct_shares"
+      ],
+      "rsi": [
+        "strategy.rsi_window",
+        "strategy.rsi_oversold",
+        "strategy.rsi_overbought",
+        "portfolio.cooldown_bars",
+        "portfolio.buy_pct_cash",
+        "portfolio.sell_pct_shares"
+      ],
+      "macd": [
+        "strategy.macd_fast_window",
+        "strategy.macd_slow_window",
+        "strategy.macd_signal_window",
+        "portfolio.cooldown_bars",
+        "portfolio.buy_pct_cash",
+        "portfolio.sell_pct_shares"
+      ],
+      "bollinger": [
+        "strategy.bb_window",
+        "strategy.bb_k",
+        "portfolio.cooldown_bars",
+        "portfolio.buy_pct_cash",
+        "portfolio.sell_pct_shares"
+      ]
+    }
+  },
+  "portfolio": {
+    "allow_short": false,
+    "initial_cash": 100000.0,
+    "cooldown_bars": 0,
+    "min_return_before_sell": 0.0,
+    "cost_model": {
+      "brokerage_bps": 0.0,
+      "comm_bourse_bps": 0.1,
+      "reg_liv_bps": 0.2,
+      "slippage_bps": 0.0,
+      "tva_rate": 0.1
+    },
+    "volume_gate": {
+      "enabled": false,
+      "kind": "min_abs",
+      "min_volume_abs": 0.0,
+      "min_volume_ratio_adv": 0.3,
+      "adv_window": 20
+    },
+    "participation_cap": {
+      "enabled": false,
+      "rate": 0.05,
+      "basis": "bar",
+      "adv_window": 20
+    }
+  }
+}

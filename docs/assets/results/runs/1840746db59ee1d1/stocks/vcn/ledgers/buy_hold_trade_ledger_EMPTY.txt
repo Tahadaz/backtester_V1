@@ -1,0 +1,1 @@
+No trade_ledger table found or it is empty.

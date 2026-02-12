@@ -1,0 +1,2 @@
+entry_time,exit_time,symbol,side,qty,entry_price,exit_price,gross_pnl,entry_cost,exit_cost,net_pnl,return_pct,hold_days
+2026-01-22 00:00:00+00:00,2026-01-29 00:00:00+00:00,sgtm,LONG,31,820.0,888.0,2108.0,0.83886,0.9084240000000001,2106.252716,0.08285809268292683,7

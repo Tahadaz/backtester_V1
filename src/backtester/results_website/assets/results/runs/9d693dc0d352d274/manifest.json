@@ -1,0 +1,15 @@
+{
+  "site_title": "Backtester Results",
+  "about": {
+    "subtitle": "Optimization runs (cached)",
+    "bullets": []
+  },
+  "stocks": [
+    {
+      "ticker": "IAM",
+      "name": "IAM"
+    }
+  ],
+  "generated_at": "2026-02-12T12:57:41",
+  "run_id": "9d693dc0d352d274"
+}
