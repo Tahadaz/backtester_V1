@@ -128,6 +128,62 @@ def _extract_zip_bytes_to_folder(zip_bytes: bytes, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
         z.extractall(out_dir)
+import streamlit.components.v1 as components
+
+def _render_site_store(store: dict):
+    """
+    Render exactly what the site/zip contains:
+      - per ticker: leaderboard
+      - per strategy: plot html + trade ledger table
+    """
+    if not store:
+        st.info("No batch results to display yet.")
+        return
+
+    tickers = sorted(store.keys())
+    st.subheader("Batch results (same content as website ZIP)")
+
+    for ticker in tickers:
+        payload = store[ticker]
+        lb_df = payload.get("leaderboard_df", pd.DataFrame())
+        top5_kinds = payload.get("top5_kinds", [])  # set in _push_ticker_results_to_site_store
+
+        with st.expander(f"{ticker} — leaderboard / plots / ledgers", expanded=False):
+            st.markdown("### Leaderboard")
+            st.dataframe(lb_df, use_container_width=True)
+
+            best_bundles = payload.get("best_bundles", {})
+            best_specs   = payload.get("best_specs", {})
+
+            for kind in top5_kinds:
+                if kind not in best_bundles or kind not in best_specs:
+                    continue
+
+                b = best_bundles[kind]
+                spec = best_specs[kind]
+
+                st.markdown(f"### {kind}")
+
+                # ---- Plot: same as site builder ----
+                sym0 = b.md.symbols()[0]
+                bars = b.md.bars[sym0]
+                pp = b.report.plots.get("price_panel", {})
+                fig = plot_price_indicators_trades_line(
+                    bars=bars,
+                    strategy_params=spec.strategy.params,
+                    indicators=pp.get("indicators"),
+                    trades=pp.get("trades"),
+                    indicator_cols=pp.get("indicator_cols"),
+                    port_cfg=spec.portfolio,
+                )
+                html = fig.to_html(full_html=True, include_plotlyjs="cdn")
+                components.html(html, height=650, scrolling=True)
+
+                # ---- Ledger: same as site builder ----
+                tables = getattr(b, "report", None).tables if getattr(b, "report", None) is not None else {}
+                tl = tables.get("trade_ledger", pd.DataFrame())
+                st.markdown("#### Trade Ledger (PnL per closed trade)")
+                st.dataframe(tl, use_container_width=True)
 
 def _push_ticker_results_to_site_store(
     *,
@@ -3240,7 +3296,7 @@ with tab_opt:
                 volume_gate=volume_gate_spec,
                 participation_cap=participation_cap_spec,
                 domains_by_kind=domains_by_kind,
-                app_version="v1",
+                app_version="v2_signals_ledgers",
             )
 
             run_id = run_id_from_spec(run_spec)
@@ -3253,26 +3309,26 @@ with tab_opt:
                 st.success("Cached run found on disk — skipping optimization.")
                 st.caption(f"Run folder: {run_dir.as_posix()}")
 
-                # If the site artifacts are missing/incomplete, rebuild them from the current session store.
-                if not _run_folder_has_site(run_dir):
-                    store_now = st.session_state.get("site_export_store", {})
-                    if store_now:
-                        st.warning("Cached run is missing site artifacts (plots/ledgers). Rebuilding export from session store...")
-                        zip_site = _make_site_zip_from_store(
-                            store=store_now,
-                            site_title="Backtest Results",
-                        )
-                        _extract_zip_bytes_to_folder(zip_site, run_dir)
-                        st.success("Rebuilt site artifacts into the run folder.")
-                    else:
-                        # No store in memory => you cannot recreate plots/ledgers deterministically.
-                        st.error(
-                            "Cached run exists (DONE) but the run folder has no site artifacts, "
-                            "and the session store is empty. "
-                            "Delete the DONE flag (or add a 'force rerun' button) to recompute/export."
-                        )
-                        st.code(str(done_flag), language="text")
-                        st.stop()
+                # Always offer the existing run_dir as a ZIP (even if session store is empty)
+                # (This guarantees user can download whatever is on disk.)
+                buf_disk = io.BytesIO()
+                with zipfile.ZipFile(buf_disk, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                    for fp in run_dir.rglob("*"):
+                        if fp.is_file():
+                            z.write(fp, fp.relative_to(run_dir))
+                buf_disk.seek(0)
+
+                st.download_button(
+                    label="Download RUN FOLDER ZIP (from disk cache)",
+                    data=buf_disk.getvalue(),
+                    file_name=f"run_{run_id}.zip",
+                    mime="application/zip",
+                    key="dl_run_zip_from_disk",
+                )
+
+                st.code(f"results_website/index.html?run_id={run_id}", language="text")
+                st.stop()
+
 
                 # viewer link
                 st.code(f"results_website/index.html?run_id={run_id}", language="text")
@@ -3670,6 +3726,8 @@ with tab_opt:
                     st.session_state["site_export_store"] = {}
                     st.success("Cleared.")
 
+                st.session_state["last_batch_run_id"] = run_id
+                st.session_state["last_batch_store"] = store
 
                 # Persist for reruns
                 st.session_state["opt_leaderboard_df"] = df_lb
