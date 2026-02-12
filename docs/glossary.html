@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Metrics & Parameters Glossary | Backtest Results</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    .glossary-content {
+      padding: 1.5rem;
+      max-width: 900px;
+    }
+    
+    .glossary-content h4 {
+      margin-top: 2rem;
+      margin-bottom: 0.5rem;
+      color: rgba(15,23,42,0.92);
+      font-size: 1.1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 2px solid var(--border);
+    }
+    
+    .glossary-content h4:first-child {
+      margin-top: 0;
+    }
+    
+    .glossary-content p {
+      margin: 0.5rem 0 0 0;
+      line-height: 1.6;
+    }
+    
+    .glossary-content code {
+      background: rgba(29,78,216,0.06);
+      border-color: rgba(29,78,216,0.15);
+    }
+    
+    .divider {
+      border: 0;
+      border-top: 1px solid var(--border);
+      margin: 2rem 0;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="topbar">
+    <div class="container topbar__inner">
+      <div class="brand">
+        <div class="brand__mark">BT</div>
+        <div>
+          <div class="brand__title">Backtest Results</div>
+          <div class="brand__subtitle">Glossary of metrics & parameters</div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <a class="btn btn--ghost" href="index.html">← Back to results</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="container" style="padding: 1.5rem 0 3rem;">
+    <div class="panel">
+      <div class="panel__header">
+        <div class="panel__header--row">
+          <h3 class="panel__title">Performance Metrics & Strategy Parameters</h3>
+          <div class="panel__meta">Click any metric in the leaderboard to jump here</div>
+        </div>
+      </div>
+
+      <div class="glossary-content">
+        <h4 id="cagr">CAGR (Compound Annual Growth Rate)</h4>
+        <p class="muted">
+          The annualized growth rate of your investment over the backtest period. It represents the constant yearly rate 
+          that would yield the same total return. Formula: <code>CAGR = (Ending Value / Starting Value)^(1 / Years) - 1</code>
+        </p>
+        <p class="muted">
+          <strong>Example:</strong> A CAGR of 15% means your portfolio would grow by 15% per year on average. 
+          This is the most important metric for comparing long-term strategy performance.
+        </p>
+
+        <h4 id="total-return">Total Return</h4>
+        <p class="muted">
+          The cumulative percentage return over the entire backtest period. 
+          Formula: <code>Total Return = (Ending Equity / Starting Equity) - 1</code>
+        </p>
+        <p class="muted">
+          <strong>Example:</strong> A total return of 150% means your initial investment increased by 150%, 
+          so $100,000 became $250,000.
+        </p>
+
+        <h4 id="pnl">PnL (Profit and Loss)</h4>
+        <p class="muted">
+          The absolute dollar amount gained or lost over the backtest period. This is simply the difference 
+          between ending equity and starting equity.
+        </p>
+        <p class="muted">
+          <strong>Note:</strong> While useful for understanding absolute gains, PnL doesn't account for risk 
+          or the time value of money, so CAGR and Sharpe are better for strategy comparison.
+        </p>
+
+        <h4 id="max-drawdown">Max Drawdown (MDD)</h4>
+        <p class="muted">
+          The largest peak-to-trough decline in equity during the backtest period. This measures the worst 
+          loss you would have experienced from a previous high point.
+        </p>
+        <p class="muted">
+          <strong>Example:</strong> A max drawdown of -25% means at one point, your portfolio declined 25% 
+          from its highest value. Lower drawdowns indicate more stable strategies.
+        </p>
+        <p class="muted">
+          <strong>Why it matters:</strong> Drawdown tests your risk tolerance. A strategy with 50% annual returns 
+          but -60% drawdown might be psychologically unbearable, causing you to abandon it at the worst time.
+        </p>
+
+        <h4 id="sharpe">Sharpe Ratio</h4>
+        <p class="muted">
+          A risk-adjusted return metric that measures excess return per unit of risk (volatility). 
+          Formula: <code>Sharpe = (Mean Return - Risk-Free Rate) / Std Dev of Returns</code>
+        </p>
+        <p class="muted">
+          <strong>Interpretation:</strong>
+          <br>• Sharpe < 1.0: Poor risk-adjusted returns
+          <br>• Sharpe 1.0-2.0: Good risk-adjusted returns
+          <br>• Sharpe 2.0-3.0: Very good risk-adjusted returns
+          <br>• Sharpe > 3.0: Exceptional risk-adjusted returns
+        </p>
+        <p class="muted">
+          <strong>Example:</strong> A Sharpe of 2.5 means you're earning 2.5 units of return for every unit 
+          of risk taken. Higher is always better.
+        </p>
+
+        <h4 id="trades"># Trades</h4>
+        <p class="muted">
+          The total number of round-trip trades (buy and sell pairs) executed during the backtest period.
+        </p>
+        <p class="muted">
+          <strong>Why it matters:</strong> More trades mean higher transaction costs and potentially more 
+          complexity. A strategy with 500 trades vs. 50 trades needs to generate enough extra return to 
+          justify the additional costs and effort.
+        </p>
+
+        <h4 id="win-rate">Win % (Win Rate)</h4>
+        <p class="muted">
+          The percentage of trades that were profitable. Formula: <code>Win Rate = (Winning Trades / Total Trades) × 100</code>
+        </p>
+        <p class="muted">
+          <strong>Important note:</strong> Win rate alone is misleading. A strategy with 90% win rate but small 
+          wins and large losses can still lose money. Always consider win rate alongside average win/loss size.
+        </p>
+
+        <hr class="divider">
+
+        <h4 id="signal">Signal (-1, 0, +1)</h4>
+        <p class="muted">
+          The trading recommendation produced by each strategy:
+          <br>• <strong>+1 (BUY):</strong> Strategy indicates a long position should be taken
+          <br>• <strong>0 (HOLD):</strong> Strategy indicates holding current position or staying in cash
+          <br>• <strong>-1 (SELL):</strong> Strategy indicates closing positions or taking a short position
+        </p>
+        <p class="muted">
+          <strong>Aggregation:</strong> The final stock signal is computed by combining individual strategy signals 
+          using either majority vote (most common signal wins) or weighted vote (each strategy's signal is weighted 
+          by its performance metric, typically CAGR).
+        </p>
+
+        <h4 id="cooldown-bars">Cooldown Bars</h4>
+        <p class="muted">
+          The minimum number of time periods (bars) that must pass between consecutive trades. This parameter 
+          prevents overtrading and reduces transaction costs.
+        </p>
+        <p class="muted">
+          <strong>Example:</strong> With cooldown_bars=5 on daily data, after selling a position, the strategy 
+          must wait at least 5 days before buying again.
+        </p>
+
+        <h4 id="window">Window / Lookback Period</h4>
+        <p class="muted">
+          The number of historical bars used to calculate an indicator. Different indicators use different windows:
+          <br>• <strong>RSI Window:</strong> Typically 14 periods (14 days for daily data)
+          <br>• <strong>MA Window:</strong> Can vary from 20 (short-term) to 200 (long-term)
+          <br>• <strong>Bollinger Window:</strong> Typically 20 periods
+        </p>
+        <p class="muted">
+          <strong>Trade-off:</strong> Shorter windows react faster to price changes but generate more false signals. 
+          Longer windows are smoother but slower to respond to trend changes.
+        </p>
+
+        <h4 id="rsi">RSI (Relative Strength Index)</h4>
+        <p class="muted">
+          A momentum oscillator that measures the speed and magnitude of price changes, ranging from 0 to 100.
+          <br>• <strong>RSI > 70:</strong> Traditionally considered "overbought" (potential sell signal)
+          <br>• <strong>RSI < 30:</strong> Traditionally considered "oversold" (potential buy signal)
+        </p>
+        <p class="muted">
+          <strong>Parameters:</strong>
+          <br>• <code>rsi_window</code>: Lookback period (commonly 14)
+          <br>• <code>rsi_overbought</code>: Upper threshold (commonly 70)
+          <br>• <code>rsi_oversold</code>: Lower threshold (commonly 30)
+        </p>
+
+        <h4 id="macd">MACD (Moving Average Convergence Divergence)</h4>
+        <p class="muted">
+          A trend-following momentum indicator showing the relationship between two moving averages.
+          <br>• <strong>Signal:</strong> Buy when MACD line crosses above signal line; sell when it crosses below
+        </p>
+        <p class="muted">
+          <strong>Parameters:</strong>
+          <br>• <code>macd_fast_window</code>: Fast EMA period (commonly 12)
+          <br>• <code>macd_slow_window</code>: Slow EMA period (commonly 26)
+          <br>• <code>macd_signal_window</code>: Signal line EMA period (commonly 9)
+        </p>
+
+        <h4 id="bollinger">Bollinger Bands</h4>
+        <p class="muted">
+          Volatility bands placed above and below a moving average. Price touching the upper band may indicate 
+          overbought conditions; touching the lower band may indicate oversold conditions.
+        </p>
+        <p class="muted">
+          <strong>Parameters:</strong>
+          <br>• <code>bb_window</code>: Moving average period (commonly 20)
+          <br>• <code>bb_k</code>: Number of standard deviations for band width (commonly 2.0)
+        </p>
+
+        <h4 id="sma">SMA (Simple Moving Average)</h4>
+        <p class="muted">
+          The average price over a specified number of periods. Commonly used for trend identification:
+          <br>• <strong>Price > SMA:</strong> Potential uptrend (bullish)
+          <br>• <strong>Price < SMA:</strong> Potential downtrend (bearish)
+        </p>
+        <p class="muted">
+          <strong>Parameters:</strong>
+          <br>• <code>window</code>: Number of periods to average (commonly 50 or 200)
+        </p>
+
+        <hr class="divider">
+
+        <h4 id="portfolio-params">Portfolio Management Parameters</h4>
+        <p class="muted">
+          <strong><code>buy_pct_cash</code>:</strong> Percentage of available cash to use when buying (e.g., 1.0 = 100%, 0.5 = 50%)
+        </p>
+        <p class="muted">
+          <strong><code>sell_pct_shares</code>:</strong> Percentage of held shares to sell when selling (e.g., 1.0 = 100%, 0.25 = 25%)
+        </p>
+        <p class="muted">
+          <strong><code>min_return_before_sell</code>:</strong> Minimum return threshold before allowing a sell (prevents premature exits)
+        </p>
+        <p class="muted">
+          <strong><code>sizing_mode</code>:</strong> How position sizes are calculated (e.g., pct_cash_shares, fixed_dollar, risk_based)
+        </p>
+        <p class="muted">
+          <strong><code>rebalance_policy</code>:</strong> When to rebalance positions (e.g., on_change = immediate, daily, weekly)
+        </p>
+
+        <hr class="divider">
+
+        <p style="margin-top: 2rem; padding: 1rem; background: rgba(29,78,216,0.04); border-radius: 12px; border: 1px solid rgba(29,78,216,0.15);">
+          <strong>📚 Need more information?</strong> These metrics and parameters are industry-standard tools 
+          for quantitative trading. For deeper understanding, we recommend researching each concept independently 
+          or consulting financial textbooks like "Quantitative Trading" by Ernest Chan or "Evidence-Based Technical Analysis" 
+          by David Aronson.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <footer class="footer">
+    <div class="container footer__inner">
+      <div class="footer__left">
+        <span class="muted">Institutional-grade backtest analysis platform</span>
+      </div>
+      <div class="footer__right">
+        <span class="muted">© <span id="year"></span></span>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    document.getElementById("year").textContent = String(new Date().getFullYear());
+  </script>
+</body>
+</html>

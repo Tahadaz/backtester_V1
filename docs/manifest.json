@@ -1,0 +1,78 @@
+{
+  "site_title": "Backtest Results",
+  "about": {
+    "subtitle": "Technical-analysis strategy backtests and parameter optimization",
+    "bullets": [
+      "We test multiple TA strategies (SMA, MA Cross, RSI, MACD, Bollinger).",
+      "We optimize parameters per strategy and compare performance.",
+      "We report risk and trading statistics and visualize signals."
+    ]
+  },
+  "stocks": [
+    {
+      "ticker": "CSR",
+      "name": "CSR"
+    },
+    {
+      "ticker": "SNA",
+      "name": "SNA"
+    },
+    {
+      "ticker": "adh",
+      "name": "adh"
+    },
+    {
+      "ticker": "adi",
+      "name": "adi"
+    },
+    {
+      "ticker": "akt",
+      "name": "akt"
+    },
+    {
+      "ticker": "atw",
+      "name": "atw"
+    },
+    {
+      "ticker": "bcp",
+      "name": "bcp"
+    },
+    {
+      "ticker": "cap",
+      "name": "cap"
+    },
+    {
+      "ticker": "cdm",
+      "name": "cdm"
+    },
+    {
+      "ticker": "cfg",
+      "name": "cfg"
+    },
+    {
+      "ticker": "jet",
+      "name": "jet"
+    },
+    {
+      "ticker": "lhm",
+      "name": "lhm"
+    },
+    {
+      "ticker": "msa",
+      "name": "msa"
+    },
+    {
+      "ticker": "sgtm",
+      "name": "sgtm"
+    },
+    {
+      "ticker": "tgc",
+      "name": "tgc"
+    },
+    {
+      "ticker": "vcn",
+      "name": "vcn"
+    }
+  ],
+  "generated_at": "2026-02-11T15:19:08"
+}
