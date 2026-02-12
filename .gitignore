@@ -60,5 +60,3 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# Runs
-runs/
