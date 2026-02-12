@@ -1,0 +1,75 @@
+{
+  "site_title": "Backtester Results",
+  "about": {
+    "subtitle": "Optimization runs (cached)",
+    "bullets": []
+  },
+  "stocks": [
+    {
+      "ticker": "CSR",
+      "name": "CSR"
+    },
+    {
+      "ticker": "SNA",
+      "name": "SNA"
+    },
+    {
+      "ticker": "adh",
+      "name": "adh"
+    },
+    {
+      "ticker": "adi",
+      "name": "adi"
+    },
+    {
+      "ticker": "akt",
+      "name": "akt"
+    },
+    {
+      "ticker": "atw",
+      "name": "atw"
+    },
+    {
+      "ticker": "bcp",
+      "name": "bcp"
+    },
+    {
+      "ticker": "cap",
+      "name": "cap"
+    },
+    {
+      "ticker": "cdm",
+      "name": "cdm"
+    },
+    {
+      "ticker": "cfg",
+      "name": "cfg"
+    },
+    {
+      "ticker": "jet",
+      "name": "jet"
+    },
+    {
+      "ticker": "lhm",
+      "name": "lhm"
+    },
+    {
+      "ticker": "msa",
+      "name": "msa"
+    },
+    {
+      "ticker": "sgtm",
+      "name": "sgtm"
+    },
+    {
+      "ticker": "tgc",
+      "name": "tgc"
+    },
+    {
+      "ticker": "vcn",
+      "name": "vcn"
+    }
+  ],
+  "generated_at": "2026-02-12T12:51:30",
+  "run_id": "be735e9536b3604b"
+}

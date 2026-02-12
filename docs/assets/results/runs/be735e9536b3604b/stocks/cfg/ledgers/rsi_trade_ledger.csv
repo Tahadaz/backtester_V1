@@ -1,0 +1,2 @@
+entry_time,exit_time,symbol,side,qty,entry_price,exit_price,gross_pnl,entry_cost,exit_cost,net_pnl,return_pct,hold_days
+2024-02-01 00:00:00+00:00,2024-09-23 00:00:00+00:00,cfg,LONG,671,149.0,196.5,31872.5,3.299307,4.3510995,31864.8495935,0.31871542617449666,235

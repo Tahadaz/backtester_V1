@@ -1,0 +1,2 @@
+entry_time,exit_time,symbol,side,qty,entry_price,exit_price,gross_pnl,entry_cost,exit_cost,net_pnl,return_pct,hold_days
+2023-01-03 00:00:00+00:00,2024-11-15 00:00:00+00:00,lhm,LONG,73,1360.0,1955.0,43435.0,3.27624,4.709595,43427.014165,0.4374195625,682
