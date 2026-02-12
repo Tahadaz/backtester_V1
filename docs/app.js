@@ -1055,7 +1055,7 @@ async function init() {
   // Pre-load signals for all stocks
   for (const stock of STOCKS) {
     try {
-      const csvUrl = `assets/results/stocks/${stock.ticker}/leaderboard.csv`;
+      const csvUrl = `${runRoot()}/stocks/${stock.ticker}/leaderboard.csv`;
       const csv = await fetchText(csvUrl);
       const { headers, rows } = parseCSV(csv);
       const aggregation = computeSignalAggregation(headers, rows);
