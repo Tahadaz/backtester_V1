@@ -159,7 +159,14 @@ class ResultsAnalyzer:
         
         # trades payload (fills)
         init_cash = float(portfolio_result.meta.get("config", {}).get("initial_cash", 0.0))
-        trades = self._prepare_trades_table(portfolio_result.trades, initial_cash=init_cash)
+        sym0 = symbols[0]
+        trades = self._prepare_trades_table(
+            portfolio_result.trades,
+            initial_cash=init_cash,
+            mark_price=px,   # Close series aligned on equity index
+        )
+
+
         trade_ledger = self._trade_ledger_from_fills(trades)
         trade_perf = self._trade_performance_summary(trade_ledger)
 
@@ -454,39 +461,76 @@ class ResultsAnalyzer:
     # =============================
     # Trades / fills
     # =============================
-    def _prepare_trades_table(self, trades: pd.DataFrame, initial_cash: float) -> pd.DataFrame:
-        """Normalize fills and enrich with a running net_invested ledger.
-
-        This is a *fills ledger* (one row per execution), not a round-trip ledger.
-        - qty is signed (buy>0, sell<0)
-        - notional is absolute (|qty| * price)
-        - net_invested is cumulative signed notional: +notional for buys, -notional for sells
+    def _prepare_trades_table(
+        self,
+        trades: pd.DataFrame,
+        initial_cash: float,
+        *,
+        mark_price: pd.Series | None = None,
+    ) -> pd.DataFrame:
         """
-        cols = [
+        Fills ledger + CMP (weighted average cost) + realized/latent PnL.
+
+        Keeps your existing audit fields:
+        timestamp, symbol, qty, side, price, notional, cost,
+        signed_notional, net_invested, cash_after,
+        month_net_invested, is_last_sell_in_month, month_volumeinv_at_last_sell, month
+
+        Adds requested columns:
+        trade_date, quantity, fees,
+        available_quantity, cmp,
+        position_value_cost (= cmp * available_quantity),
+        pnl_realise, pnl_latent
+
+        Important:
+        - Fees are capitalized into CMP when opening/increasing a position.
+        - Fees are deducted from realized PnL when closing/reducing (pro-rated on flips).
+        - Latent PnL marked to `mark_price` at trade timestamp when provided, else uses execution price.
+        """
+        base_cols = [
             "timestamp", "symbol", "qty", "side", "price", "notional", "cost",
             "commission_ht", "vat", "slippage",
             "signed_notional", "net_invested", "cash_after",
         ]
-        if trades is None or trades.empty:
-            return pd.DataFrame(columns=cols)
-        df = trades.copy()
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-        # Ensure numeric
-        for c in ["qty", "price", "notional", "cost"]:
+        if trades is None or trades.empty:
+            out_cols = [
+                "side", "trade_date", "quantity", "price", "fees",
+                "available_quantity", "cmp", "position_value_cost",
+                "pnl_realise", "pnl_latent",
+            ] + base_cols + [
+                "month_net_invested", "is_last_sell_in_month", "month_volumeinv_at_last_sell", "month"
+            ]
+            # remove dupes while preserving order
+            seen = set()
+            out_cols = [c for c in out_cols if not (c in seen or seen.add(c))]
+            return pd.DataFrame(columns=out_cols)
+
+        df = trades.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"]).reset_index(drop=True)
+
+        # numeric
+        for c in ["qty", "price", "notional", "cost", "commission_ht", "vat", "slippage"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
 
+        # side
         if "side" not in df.columns:
-            # qty is signed
             df["side"] = np.where(df["qty"].astype(float) > 0, "BUY", "SELL")
+        df["side"] = df["side"].astype(str).str.upper()
 
-        # Make sure cost exists
+        # cost
         if "cost" not in df.columns:
             df["cost"] = 0.0
+        df["cost"] = df["cost"].fillna(0.0).astype(float)
 
-        # notional is expected to be absolute; derive signed notional from signed qty
-        df["signed_notional"] = np.where(df["qty"].astype(float) >= 0, df["notional"].astype(float), -df["notional"].astype(float))
+        # notional (absolute)
+        if "notional" not in df.columns:
+            df["notional"] = (df["qty"].abs() * df["price"]).astype(float)
+
+        # signed notional (your convention)
+        df["signed_notional"] = np.where(df["qty"].astype(float) >= 0, df["notional"], -df["notional"]).astype(float)
 
         keep = [c for c in [
             "timestamp", "symbol", "qty", "side", "price", "notional", "cost",
@@ -495,51 +539,130 @@ class ResultsAnalyzer:
         ] if c in df.columns]
         df = df[keep].sort_values(["timestamp", "symbol"]).reset_index(drop=True)
 
-        # Running net invested across all fills (account-level)
+        # account-level running net invested + cash path (same as your current)
         df["net_invested"] = df["signed_notional"].cumsum()
+        df["cash_after"] = float(initial_cash) + (-df["signed_notional"] - df["cost"]).cumsum()
 
-        # Reconstruct cash path using the same convention as PortfolioState.apply_fill
-        # cash_{t} = initial_cash + cumsum( -signed_notional - cost )
-        df["cash_after"] = float(initial_cash) + (-df["signed_notional"] - df["cost"].fillna(0.0)).cumsum()
+        # requested aliases
+        df["trade_date"] = df["timestamp"]
+        df["quantity"] = df["qty"].abs().astype(float)
+        df["fees"] = df["cost"].astype(float)
+
+        # mark price
+        if mark_price is not None and isinstance(mark_price, pd.Series) and not mark_price.empty:
+            mp = mark_price.copy()
+            mp.index = pd.to_datetime(mp.index)
+            # map exact timestamps; if your timestamps are daily, this matches
+            df["_mark"] = df["timestamp"].map(mp.to_dict())
+            df["_mark"] = pd.to_numeric(df["_mark"], errors="coerce")
+        else:
+            df["_mark"] = np.nan
+
+        # CMP accounting columns
+        df["available_quantity"] = np.nan
+        df["cmp"] = np.nan
+        df["position_value_cost"] = np.nan   # NEW NAME: cmp * available_quantity
+        df["pnl_realise"] = 0.0
+        df["pnl_latent"] = np.nan
+
+        for sym, g_idx in df.groupby("symbol").groups.items():
+            pos = 0.0
+            cmp_ = 0.0
+
+            def fee_split(total_fee: float, close_abs: float, total_abs: float) -> tuple[float, float]:
+                if total_abs <= 0:
+                    return 0.0, total_fee
+                close_fee = total_fee * (close_abs / total_abs)
+                return close_fee, total_fee - close_fee
+
+            for i in g_idx:
+                qty_signed = float(df.at[i, "qty"])
+                q = abs(qty_signed)
+                px = float(df.at[i, "price"])
+                fee = float(df.at[i, "fees"])
+                mark = df.at[i, "_mark"]
+                if not np.isfinite(mark):
+                    mark = px
+
+                prev_pos = pos
+                prev_cmp = cmp_
+
+                realised = 0.0
+
+                # Open/add same direction
+                if prev_pos == 0 or np.sign(prev_pos) == np.sign(qty_signed):
+                    new_pos = prev_pos + qty_signed
+                    old_basis = abs(prev_pos) * prev_cmp
+                    add_basis = q * px + fee
+                    new_basis = old_basis + add_basis
+                    cmp_ = (new_basis / abs(new_pos)) if abs(new_pos) > 0 else 0.0
+                    pos = new_pos
+
+                # Reduce/close/flip
+                else:
+                    close_abs = min(abs(prev_pos), q)
+                    open_abs = max(0.0, q - close_abs)
+                    close_fee, open_fee = fee_split(fee, close_abs, q)
+
+                    if prev_pos > 0:
+                        # selling long
+                        realised = close_abs * (px - prev_cmp) - close_fee
+                    else:
+                        # buying back short
+                        realised = close_abs * (prev_cmp - px) - close_fee
+
+                    pos = prev_pos + qty_signed
+
+                    if pos == 0:
+                        cmp_ = 0.0
+                    else:
+                        # flip => remainder opens new position with open_fee in basis
+                        if np.sign(pos) != np.sign(prev_pos):
+                            cmp_ = (open_abs * px + open_fee) / open_abs if open_abs > 0 else px
+                        else:
+                            # partial close => CMP unchanged
+                            cmp_ = prev_cmp
+
+                df.at[i, "pnl_realise"] = float(realised)
+                df.at[i, "available_quantity"] = float(pos)
+                df.at[i, "cmp"] = float(cmp_)
+                df.at[i, "position_value_cost"] = float(cmp_ * pos)
+
+                if pos == 0:
+                    df.at[i, "pnl_latent"] = 0.0
+                elif pos > 0:
+                    df.at[i, "pnl_latent"] = float(pos * (mark - cmp_))
+                else:
+                    df.at[i, "pnl_latent"] = float(abs(pos) * (cmp_ - mark))
 
         # -------------------------------
-        # Monthly VolumeInv reset markers
+        # KEEP your Monthly VolumeInv reset markers (unchanged)
         # -------------------------------
-        # These columns make the Efficiency denominator auditable from the fills ledger.
-        # - month_net_invested: cumulative signed_notional within each calendar month
-        # - is_last_sell_in_month: True on the last SELL fill of each month (if any)
-        # - month_volumeinv_at_last_sell: month_net_invested value on that last SELL row (else NaN)
-        # Overall VolumeInv (used for Efficiency) equals:
-        #   sum(month_volumeinv_at_last_sell over months with sells) + sum(month_net_invested end-of-month for months with no sells)
         df["_month"] = df["timestamp"].dt.to_period("M")
-
-        # Cumulative signed notional within month
         df["month_net_invested"] = df.groupby("_month")["signed_notional"].cumsum()
 
-        # Identify last SELL timestamp per month (if any)
         sell_mask = df["side"].astype(str).str.upper().eq("SELL")
         last_sell_ts = (
             df.loc[sell_mask]
-              .groupby("_month")["timestamp"]
-              .max()
+            .groupby("_month")["timestamp"]
+            .max()
         )
-
         df["is_last_sell_in_month"] = df["_month"].map(last_sell_ts).eq(df["timestamp"])
-
-        # Put the month_net_invested value only on the last sell row
-        df["month_volumeinv_at_last_sell"] = np.where(
-            df["is_last_sell_in_month"],
-            df["month_net_invested"],
-            np.nan,
-        )
-
-        # Human-readable month label
+        df["month_volumeinv_at_last_sell"] = np.where(df["is_last_sell_in_month"], df["month_net_invested"], np.nan)
         df["month"] = df["_month"].astype(str)
-
-        # Cleanup internal
         df = df.drop(columns=["_month"])
 
+        # final order: requested columns first (plus keep fills columns)
+        display_cols = [
+            "side", "trade_date", "quantity", "price", "fees",
+            "available_quantity", "cmp", "position_value_cost",
+            "pnl_realise", "pnl_latent",
+        ]
+        audit_cols = [c for c in df.columns if c not in display_cols]
+        df = df[display_cols + audit_cols]
+
         return df
+
 
 
     def _volume_invested_reset_last_sell_monthly(self, fills: pd.DataFrame) -> float:
