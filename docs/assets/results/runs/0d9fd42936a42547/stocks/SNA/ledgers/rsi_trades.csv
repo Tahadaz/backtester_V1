@@ -1,0 +1,2 @@
+timestamp,symbol,side,prix d'éxécution (open du jour),quantité,cmp,pnl realisé,pnl latent,close du jour,available_quantity,position_value_cost,cost
+2025-12-31 00:00:00+00:00,SNA,BUY,91.1,274.0,91.10300629999999,0.0,793.7762738000027,94.0,274.0,24962.223726199998,0.8237262

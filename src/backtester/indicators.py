@@ -73,6 +73,27 @@ class FeatureSpec:
         if self.indicator in ("rolling_std", "std", "stdev", "vol"):
             w = p.get("window", p.get("period", p.get("n")))
             return f"std_{w}" if w is not None else "std"
+        
+        if self.indicator == "obv":
+            return "obv"
+
+        if self.indicator == "vwap":
+            w = p.get("window", p.get("n"))
+            return f"vwap_{w}" if w is not None else "vwap"
+
+        if self.indicator == "stoch":
+            k = p.get("k_window", p.get("k", 14))
+            d = p.get("d_window", p.get("d", 3))
+            smooth = p.get("smooth_k", p.get("smooth", 1))
+            return f"stoch_{k}_{d}_{smooth}"
+
+        if self.indicator == "ichimoku":
+            tenkan = p.get("tenkan", 9)
+            kijun = p.get("kijun", 26)
+            senkou_b = p.get("senkou_b", 52)
+            shift = p.get("shift", 26)
+            return f"ichimoku_{tenkan}_{kijun}_{senkou_b}_{shift}"
+
 
         # generic fallback
         # you can expand this per-indicator later for nicer naming
@@ -359,3 +380,115 @@ def rolling_std(df: pd.DataFrame, params: Dict[str, Any]) -> pd.Series:
     w = int(params["window"])
     s = pd.to_numeric(df["Close"], errors="coerce")
     return s.rolling(w, min_periods=w).std().rename(f"std_{w}")
+@register_indicator("obv")
+def obv(bars: pd.DataFrame, params: Dict[str, Any]) -> pd.Series:
+    """
+    On-Balance Volume (OBV).
+    Requires: Close, Volume
+    """
+    close = bars["Close"].astype(float)
+    vol = bars["Volume"].astype(float).fillna(0.0)
+
+    # sign of close change
+    d = close.diff()
+    sign = np.sign(d).fillna(0.0)  # +1, 0, -1
+    # OBV increments: sign * volume
+    inc = sign * vol
+    out = inc.cumsum()
+    out.name = "obv"
+    return out
+
+
+@register_indicator("vwap")
+def rolling_vwap(bars: pd.DataFrame, params: Dict[str, Any]) -> pd.Series:
+    """
+    Daily-bar VWAP proxy: rolling VWAP using typical price.
+    VWAP_w(t) = sum(TP_i * V_i) / sum(V_i), i in window
+    TP = (High + Low + Close)/3
+
+    Requires: High, Low, Close, Volume
+    """
+    window = int(params.get("window", params.get("n", 20)))
+    high = bars["High"].astype(float)
+    low = bars["Low"].astype(float)
+    close = bars["Close"].astype(float)
+    vol = bars["Volume"].astype(float)
+
+    tp = (high + low + close) / 3.0
+
+    pv = (tp * vol).rolling(window=window, min_periods=window).sum()
+    vv = vol.rolling(window=window, min_periods=window).sum()
+
+    out = pv / vv.replace(0.0, np.nan)
+    out.name = f"vwap_{window}"
+    return out
+
+
+@register_indicator("stoch")
+def stochastic(bars: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Stochastic Oscillator.
+    %K = 100 * (Close - LL_n) / (HH_n - LL_n)
+    %D = SMA(%K, d_window)
+
+    Requires: High, Low, Close
+    Output columns: k, d
+    """
+    k_window = int(params.get("k_window", params.get("k", 14)))
+    d_window = int(params.get("d_window", params.get("d", 3)))
+    smooth_k = int(params.get("smooth_k", params.get("smooth", 1)))
+
+    high = bars["High"].astype(float)
+    low = bars["Low"].astype(float)
+    close = bars["Close"].astype(float)
+
+    hh = high.rolling(window=k_window, min_periods=k_window).max()
+    ll = low.rolling(window=k_window, min_periods=k_window).min()
+
+    denom = (hh - ll).replace(0.0, np.nan)
+    k = 100.0 * (close - ll) / denom
+
+    if smooth_k and smooth_k > 1:
+        k = k.rolling(window=smooth_k, min_periods=smooth_k).mean()
+
+    d = k.rolling(window=d_window, min_periods=d_window).mean()
+
+    return pd.DataFrame({"k": k, "d": d}, index=bars.index)
+
+
+@register_indicator("ichimoku")
+def ichimoku(bars: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Ichimoku components (standard).
+    Tenkan = (HH_tenkan + LL_tenkan)/2
+    Kijun  = (HH_kijun  + LL_kijun)/2
+    SpanA  = (Tenkan + Kijun)/2 shifted +shift
+    SpanB  = (HH_senkouB + LL_senkouB)/2 shifted +shift
+
+    Requires: High, Low, Close (Close not strictly needed here, but kept consistent)
+    Output columns: tenkan, kijun, span_a, span_b
+    """
+    tenkan = int(params.get("tenkan", 9))
+    kijun = int(params.get("kijun", 26))
+    senkou_b = int(params.get("senkou_b", 52))
+    shift = int(params.get("shift", 26))
+
+    high = bars["High"].astype(float)
+    low = bars["Low"].astype(float)
+
+    tenkan_line = (high.rolling(tenkan, min_periods=tenkan).max() +
+                   low.rolling(tenkan, min_periods=tenkan).min()) / 2.0
+
+    kijun_line = (high.rolling(kijun, min_periods=kijun).max() +
+                  low.rolling(kijun, min_periods=kijun).min()) / 2.0
+
+    span_a = ((tenkan_line + kijun_line) / 2.0).shift(shift)
+
+    span_b = (high.rolling(senkou_b, min_periods=senkou_b).max() +
+              low.rolling(senkou_b, min_periods=senkou_b).min()) / 2.0
+    span_b = span_b.shift(shift)
+
+    return pd.DataFrame(
+        {"tenkan": tenkan_line, "kijun": kijun_line, "span_a": span_a, "span_b": span_b},
+        index=bars.index
+    )

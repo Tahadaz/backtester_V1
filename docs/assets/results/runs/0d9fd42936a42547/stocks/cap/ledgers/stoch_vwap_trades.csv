@@ -1,0 +1,3 @@
+timestamp,symbol,side,prix d'éxécution (open du jour),quantité,cmp,pnl realisé,pnl latent,close du jour,available_quantity,position_value_cost,cost
+2026-02-04 00:00:00+00:00,cap,BUY,292.0,85.0,292.009636,0.0,279.68094000000093,295.3,85.0,24820.81906,0.81906
+2026-02-09 00:00:00+00:00,cap,SELL,290.05,-22.0,292.009636,-43.32256829999976,503.392932,300.0,63.0,18396.607068,0.21057630000000005

@@ -99,6 +99,22 @@ MANUAL_DEFAULTS: dict[str, str] = {
     "strategy.bb_window": "10,14,20,30,50",
     "strategy.bb_k": "1,1.5,2,2.5,3",
 
+    # --- OBV ---
+    "strategy.obv_span": "5,10,14,20,30,50,100",
+
+    # --- Stoch + VWAP ---
+    "strategy.k_window": "7,10,14,21,28",
+    "strategy.d_window": "2,3,5,7",
+    "strategy.smooth_k": "1,2,3,5",
+    "strategy.vwap_window": "10,14,20,30,50",
+
+    # --- Ichimoku ---
+    "strategy.tenkan": "7,9,12",
+    "strategy.kijun": "22,26,30",
+    "strategy.senkou_b": "44,52,60",
+    "strategy.shift": "22,26,30",
+
+
     # --- Cooldown / sizing (if you expose them in the catalog) ---
     "portfolio.cooldown_bars": "0,5,10,21,60,120",
     "portfolio.buy_pct_cash": "0.1,0.25,0.5,0.75,1.0",
@@ -106,6 +122,37 @@ MANUAL_DEFAULTS: dict[str, str] = {
     "portfolio.min_return_before_sell": "0.0,0.01,0.02,0.05,0.10",
 }
 import json
+import numpy as np
+import pandas as pd
+
+def _as_float_or_nan(x) -> float:
+    """
+    Convert x to float if possible, else return np.nan.
+    Handles None, strings, numpy scalars, pandas scalars, 0/1-length Series.
+    """
+    if x is None:
+        return np.nan
+    # unwrap 1-element containers
+    if isinstance(x, (list, tuple, np.ndarray)) and len(x) == 1:
+        x = x[0]
+    if isinstance(x, pd.Series):
+        if len(x) == 0:
+            return np.nan
+        if len(x) == 1:
+            x = x.iloc[0]
+        else:
+            # if you accidentally passed a whole series, take the last value (most common intent)
+            x = x.iloc[-1]
+    # pandas scalar / numpy scalar -> python scalar
+    try:
+        x = x.item() if hasattr(x, "item") and not isinstance(x, (str, bytes)) else x
+    except Exception:
+        pass
+
+    try:
+        return float(pd.to_numeric(x, errors="coerce"))
+    except Exception:
+        return np.nan
 
 def format_params_for_table(params: dict) -> str:
     # compact, stable order, easy to read
@@ -181,7 +228,7 @@ def _render_site_store(store: dict):
 
                 # ---- Ledger: same as site builder ----
                 tables = getattr(b, "report", None).tables if getattr(b, "report", None) is not None else {}
-                tl = tables.get("trade_ledger", pd.DataFrame())
+                tl = tables.get("trades", pd.DataFrame())
                 st.markdown("#### Trade Ledger (PnL per closed trade)")
                 st.dataframe(tl, use_container_width=True)
 
@@ -231,11 +278,11 @@ def _push_ticker_results_to_site_store(
 
         # Trade ledger
         tables = getattr(b, "report", None).tables if getattr(b, "report", None) is not None else {}
-        tl = tables.get("trade_ledger", None)
+        tl = tables.get("trades", None)
         if isinstance(tl, pd.DataFrame) and not tl.empty:
-            ledgers_map[f"{kind}_trade_ledger.csv"] = tl.to_csv(index=False)
+            ledgers_map[f"{kind}_trades.csv"] = tl.to_csv(index=False)
         else:
-            ledgers_map[f"{kind}_trade_ledger_EMPTY.txt"] = "No trade_ledger table found or it is empty.\n"
+            ledgers_map[f"{kind}_trades_EMPTY.txt"] = "No trades table found or it is empty.\n"
 
 
     st.session_state["site_export_store"][ticker] = {
@@ -397,6 +444,195 @@ def latest_signal_from_kind(
 
         sig = 1 if close < lower else -1 if close > upper else 0
         return signal_date, int(sig), _label(int(sig))
+    
+        # ---------------- OBV ----------------
+    if kind == "obv":
+        span = int(p.get("obv_span", 20))
+
+        obv = None
+        obv_ema = None
+
+        if ind is not None:
+            # preferred names from your plot detector
+            obv_col = "obv" if "obv" in ind.columns else None
+            if obv_col is None:
+                obv_like = [c for c in ind.columns if c.lower().startswith("obv")]
+                obv_col = obv_like[0] if obv_like else None
+
+            ema_col = f"obv_ema_{span}" if f"obv_ema_{span}" in ind.columns else None
+            if ema_col is None:
+                ema_like = [c for c in ind.columns if c.startswith("obv_ema_")]
+                ema_col = ema_like[0] if ema_like else None
+
+            if obv_col is not None:
+                obv = float(pd.to_numeric(ind[obv_col], errors="coerce").iloc[-1])
+            if ema_col is not None:
+                obv_ema = float(pd.to_numeric(ind[ema_col], errors="coerce").iloc[-1])
+
+        # fallback compute if missing
+        if not np.isfinite(obv) or obv is None:
+            c = pd.to_numeric(df["Close"], errors="coerce")
+            v = pd.to_numeric(df.get("Volume", np.nan), errors="coerce").fillna(0.0)
+            sign = np.sign(c.diff().fillna(0.0))
+            obv_series = (sign * v).cumsum()
+            obv = float(obv_series.iloc[-1])
+
+        obv_ema_f = _as_float_or_nan(obv_ema)
+        if not np.isfinite(obv_ema_f):
+            # treat as missing
+            return None, 0, "HOLD"   # or whatever your fallback is
+
+
+        if not (np.isfinite(obv) and np.isfinite(obv_ema)):
+            return signal_date, 0, "NA"
+
+        sig = 1 if obv > obv_ema else -1 if obv < obv_ema else 0
+        return signal_date, int(sig), _label(int(sig))
+
+    # ---------------- Stoch + VWAP ----------------
+    if kind == "stoch_vwap":
+        k_w = int(p.get("k_window", 14))
+        d_w = int(p.get("d_window", 3))
+        s_k = int(p.get("smooth_k", 1))
+        vwap_w = int(p.get("vwap_window", 20))
+
+        # try to find indicator columns using your naming conventions
+        k_col = d_col = vwap_col = None
+
+        if ind is not None:
+            base = f"stoch_{k_w}_{d_w}_{s_k}"
+            cand_k = f"{base}__k"
+            cand_d = f"{base}__d"
+            if cand_k in ind.columns and cand_d in ind.columns:
+                k_col, d_col = cand_k, cand_d
+            else:
+                # fallback to any stoch family
+                k_like = [c for c in ind.columns if c.startswith("stoch_") and c.endswith("__k")]
+                if k_like:
+                    base0 = k_like[0].rsplit("__", 1)[0]
+                    cand_d0 = f"{base0}__d"
+                    if cand_d0 in ind.columns:
+                        k_col, d_col = k_like[0], cand_d0
+
+            cand_vwap = f"vwap_{vwap_w}"
+            if cand_vwap in ind.columns:
+                vwap_col = cand_vwap
+            else:
+                vwap_like = [c for c in ind.columns if c.startswith("vwap_")]
+                vwap_col = vwap_like[0] if vwap_like else None
+
+        # get last values
+        if ind is not None and k_col and d_col:
+            k_last = float(pd.to_numeric(ind[k_col], errors="coerce").iloc[-1])
+            d_last = float(pd.to_numeric(ind[d_col], errors="coerce").iloc[-1])
+        else:
+            # compute quick stochastic fallback
+            high = pd.to_numeric(df["High"], errors="coerce")
+            low  = pd.to_numeric(df["Low"], errors="coerce")
+            close_s = pd.to_numeric(df["Close"], errors="coerce")
+            hh = high.rolling(k_w, min_periods=k_w).max()
+            ll = low.rolling(k_w, min_periods=k_w).min()
+            raw_k = 100.0 * (close_s - ll) / (hh - ll).replace(0, np.nan)
+            if s_k > 1:
+                raw_k = raw_k.rolling(s_k, min_periods=s_k).mean()
+            d_series = raw_k.rolling(d_w, min_periods=d_w).mean()
+            k_last = float(raw_k.iloc[-1])
+            d_last = float(d_series.iloc[-1])
+
+        if ind is not None and vwap_col:
+            vwap_last = float(pd.to_numeric(ind[vwap_col], errors="coerce").iloc[-1])
+        else:
+            # rolling VWAP proxy fallback: typical price weighted by volume
+            tp = (pd.to_numeric(df["High"], errors="coerce") +
+                  pd.to_numeric(df["Low"], errors="coerce") +
+                  pd.to_numeric(df["Close"], errors="coerce")) / 3.0
+            vol = pd.to_numeric(df.get("Volume", np.nan), errors="coerce").fillna(0.0)
+            num = (tp * vol).rolling(vwap_w, min_periods=vwap_w).sum()
+            den = vol.rolling(vwap_w, min_periods=vwap_w).sum().replace(0, np.nan)
+            vwap_last = float((num / den).iloc[-1])
+
+        if not (np.isfinite(k_last) and np.isfinite(d_last) and np.isfinite(vwap_last)):
+            return signal_date, 0, "NA"
+
+        # You documented these rules in UI. Apply them on the LAST bar only.
+        close_last = close  # already computed above
+
+        buy = False
+        sell = False
+
+        # BUY rules
+        if (k_last > d_last) and (k_last < 20) and (d_last < 20) and (close_last > vwap_last):
+            buy = True
+        if (50 < k_last < 80) and (50 < d_last < 80) and (close_last > vwap_last):
+            buy = True
+        if (k_last > d_last) and (k_last < 80) and (d_last < 80) and (close_last > vwap_last):
+            buy = True
+
+        # SELL rules
+        if (k_last < d_last) and (k_last > 80) and (d_last > 80) and (close_last < vwap_last):
+            sell = True
+        if (20 < k_last < 50) and (20 < d_last < 50) and (close_last < vwap_last):
+            sell = True
+        if (k_last < d_last) and (k_last > 20) and (d_last > 20) and (close_last < vwap_last):
+            sell = True
+
+        # precedence: SELL overrides BUY
+        sig = -1 if sell else (1 if buy else 0)
+        return signal_date, int(sig), _label(int(sig))
+
+    # ---------------- Ichimoku ----------------
+    if kind == "ichimoku":
+        ten = int(p.get("tenkan", 9))
+        kij = int(p.get("kijun", 26))
+        sb  = int(p.get("senkou_b", 52))
+        sh  = int(p.get("shift", 26))
+
+        tenkan = kijun = span_a = span_b = None
+
+        if ind is not None:
+            base = f"ichimoku_{ten}_{kij}_{sb}_{sh}"
+            tcol = f"{base}__tenkan"
+            kcol = f"{base}__kijun"
+            acol = f"{base}__span_a"
+            bcol = f"{base}__span_b"
+
+            if tcol in ind.columns and kcol in ind.columns and acol in ind.columns and bcol in ind.columns:
+                tenkan = float(pd.to_numeric(ind[tcol], errors="coerce").iloc[-1])
+                kijun  = float(pd.to_numeric(ind[kcol], errors="coerce").iloc[-1])
+                span_a = float(pd.to_numeric(ind[acol], errors="coerce").iloc[-1])
+                span_b = float(pd.to_numeric(ind[bcol], errors="coerce").iloc[-1])
+            else:
+                # fallback: take first available ichimoku family
+                ten_like = [c for c in ind.columns if c.startswith("ichimoku_") and c.endswith("__tenkan")]
+                if ten_like:
+                    base0 = ten_like[0].rsplit("__", 1)[0]
+                    tcol = f"{base0}__tenkan"
+                    kcol = f"{base0}__kijun"
+                    acol = f"{base0}__span_a"
+                    bcol = f"{base0}__span_b"
+                    if tcol in ind.columns and kcol in ind.columns and acol in ind.columns and bcol in ind.columns:
+                        tenkan = float(pd.to_numeric(ind[tcol], errors="coerce").iloc[-1])
+                        kijun  = float(pd.to_numeric(ind[kcol], errors="coerce").iloc[-1])
+                        span_a = float(pd.to_numeric(ind[acol], errors="coerce").iloc[-1])
+                        span_b = float(pd.to_numeric(ind[bcol], errors="coerce").iloc[-1])
+
+        if not (np.isfinite(tenkan) and np.isfinite(kijun) and np.isfinite(span_a) and np.isfinite(span_b)):
+            return signal_date, 0, "NA"
+
+        cloud_top = max(span_a, span_b)
+        cloud_bot = min(span_a, span_b)
+
+        # Simple last-bar Ichimoku decision:
+        # BUY if price above cloud + bullish TK; SELL if price below cloud + bearish TK; else HOLD
+        if (close > cloud_top) and (tenkan > kijun):
+            sig = 1
+        elif (close < cloud_bot) and (tenkan < kijun):
+            sig = -1
+        else:
+            sig = 0
+
+        return signal_date, int(sig), _label(int(sig))
+
 
     return signal_date, 0, "NA"
 def run_opt_leaderboard_for_one_symbol(
@@ -503,7 +739,7 @@ def run_opt_leaderboard_for_one_symbol(
         return df_lb, best_bundles, best_specs, []
 
     df_lb = df_lb.sort_values(rank_metric, ascending=False, na_position="last").reset_index(drop=True)
-    top5_names = df_lb.head(5)["Strategy"].tolist()
+    top5_names = df_lb.head(7)["Strategy"].tolist()
     return df_lb, best_bundles, best_specs, top5_names
 
 
@@ -601,17 +837,17 @@ def _make_site_zip_from_store(
 
                 # 4) closed-trade ledger (PnL per closed trade)
                 tables = getattr(b, "report", None).tables if getattr(b, "report", None) is not None else {}
-                tl = tables.get("trade_ledger", None)
+                tl = tables.get("trades", None)
 
                 if isinstance(tl, pd.DataFrame) and not tl.empty:
                     z.writestr(
-                        f"stocks/{ticker}/ledgers/{kind}_trade_ledger.csv",
+                        f"stocks/{ticker}/ledgers/{kind}_trades.csv",
                         tl.to_csv(index=False).encode("utf-8"),
                     )
                 else:
                     z.writestr(
-                        f"stocks/{ticker}/ledgers/{kind}_trade_ledger_EMPTY.txt",
-                        b"No trade_ledger table found or it is empty.",
+                        f"stocks/{ticker}/ledgers/{kind}_trades_EMPTY.txt",
+                        b"No trades table found or it is empty.",
                     )
 
 
@@ -621,6 +857,22 @@ def _make_site_zip_from_store(
 
     buf.seek(0)
     return buf.getvalue()
+def _pdef_label(pdef) -> str:
+    # Try the most common attribute names first
+    for attr in ("name", "key", "param", "id", "label", "title"):
+        if hasattr(pdef, attr):
+            v = getattr(pdef, attr)
+            if isinstance(v, str) and v.strip():
+                return v
+    # Fallback: try to infer from dataclass / dict-like
+    if hasattr(pdef, "__dict__"):
+        d = pdef.__dict__
+        for k in ("name", "key", "param", "id", "label", "title"):
+            v = d.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+    # Ultimate fallback
+    return type(pdef).__name__
 
 def default_manual_txt_for_param(param_key: str, pdef) -> str:
     """
@@ -757,17 +1009,17 @@ def _make_leaderboard_zip(
             z.writestr(f"plots/{kind}_price_panel.html", html.encode("utf-8"))
             # 4) closed-trade ledger (PnL per closed trade)
             tables = getattr(b, "report", None).tables if getattr(b, "report", None) is not None else {}
-            tl = tables.get("trade_ledger", None)
+            tl = tables.get("trades", None)
 
             if isinstance(tl, pd.DataFrame) and not tl.empty:
                 z.writestr(
-                    f"ledgers/{kind}_trade_ledger.csv",
+                    f"ledgers/{kind}_trades.csv",
                     tl.to_csv(index=False).encode("utf-8"),
                 )
             else:
                 z.writestr(
-                    f"ledgers/{kind}_trade_ledger_EMPTY.txt",
-                    b"No trade_ledger table found or it is empty.",
+                    f"ledgers/{kind}_trades_EMPTY.txt",
+                    b"No trades table found or it is empty.",
                 )
 
 
@@ -922,6 +1174,49 @@ def leaderboard_row_from_report(report, *, name: str) -> dict:
         "Sharpe": sharpe,
     }
 
+def _normalize_domain_3(pdef):
+    label = _pdef_label(pdef)
+    dom = getattr(pdef, "domain", None)
+
+    if dom is None:
+        raise ValueError(f"[{label}] domain is None; expected (lo, hi, step).")
+
+    try:
+        dom = tuple(dom)
+    except TypeError:
+        raise ValueError(f"[{label}] domain is not iterable: {dom!r}")
+
+    if len(dom) == 3:
+        lo, hi, step = dom
+
+    elif len(dom) == 2:
+        lo, hi = dom
+        step = 1 if (isinstance(lo, int) and isinstance(hi, int)) else ((hi - lo) / 20 if hi != lo else 1)
+
+    elif len(dom) == 1:
+        # fixed value domain: (x,) -> lo=hi=x, step=0 sentinel
+        x = dom[0]
+        if not isinstance(x, (int, float)):
+            raise ValueError(f"[{label}] fixed domain must be numeric. Got: {dom!r}")
+        return float(x), float(x), 0.0
+
+    else:
+        raise ValueError(
+            f"[{label}] bad domain length {len(dom)}: {dom!r}. "
+            f"Expected (lo, hi, step) or (lo, hi)."
+        )
+
+    if not (isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and isinstance(step, (int, float))):
+        raise ValueError(f"[{label}] domain must be numeric (lo, hi, step). Got: {dom!r}")
+
+    if hi < lo:
+        lo, hi = hi, lo
+
+    if step == 0 and lo != hi:
+        raise ValueError(f"[{label}] step cannot be 0 unless lo==hi. Got: {dom!r}")
+
+    return float(lo), float(hi), float(step)
+
 
 def render_interval_editor_for_kind(kind: str, *, source_key: str, preview_df: pd.DataFrame | None = None):
     """
@@ -939,9 +1234,12 @@ def render_interval_editor_for_kind(kind: str, *, source_key: str, preview_df: p
         else ["strategy.rsi_window", "strategy.rsi_oversold", "strategy.rsi_overbought"] if kind == "rsi"
         else ["strategy.macd_fast_window", "strategy.macd_slow_window", "strategy.macd_signal_window"] if kind == "macd"
         else ["strategy.bb_window", "strategy.bb_k"] if kind == "bollinger"
+        else ["strategy.obv_span"] if kind == "obv"
+        else ["strategy.k_window", "strategy.d_window", "strategy.smooth_k", "strategy.vwap_window"] if kind == "stoch_vwap"
+        else ["strategy.tenkan", "strategy.kijun", "strategy.senkou_b", "strategy.shift"] if kind == "ichimoku"
         else []
     )
-
+    
     # Load previous edits if they exist
     if "opt_catalog_by_kind" not in st.session_state:
         st.session_state["opt_catalog_by_kind"] = {}
@@ -969,7 +1267,14 @@ def render_interval_editor_for_kind(kind: str, *, source_key: str, preview_df: p
         st.markdown(f"- **{k}** (`{pdef.kind}`)")
 
         if pdef.kind == "int":
-            lo, hi, step = pdef.domain
+            try:
+                lo, hi, step = _normalize_domain_3(pdef)
+            except Exception as e:
+                # Streamlit-friendly error that doesn't crash the entire app
+                st.error(f"Parameter domain error for '{getattr(pdef, 'name', 'UNKNOWN')}' : {e}")
+                # Optional: show full pdef for debugging
+                st.caption(f"pdef.domain = {getattr(pdef, 'domain', None)!r}")
+                return  # stop rendering this editor
 
             mode = st.radio(
                 "Domain mode",
@@ -1054,6 +1359,8 @@ def render_interval_editor_for_kind(kind: str, *, source_key: str, preview_df: p
                     )
                     edited_catalog[k] = replace(pdef, domain=windows)
 
+    
+
     # persist
     st.session_state["opt_catalog_by_kind"][kind] = edited_catalog
     st.session_state["opt_active_keys_by_kind"][kind] = list(active_keys)
@@ -1077,15 +1384,18 @@ def build_active_params_for_kind(kind: str) -> list[ParamDef]:
         edited_catalog = dict(catalog_default)
 
     if not active_keys:
-        # fallback default active set (same mapping you used)
         active_keys = (
             ["strategy.sma_fast_window", "strategy.sma_slow_window"] if kind == "ma_cross"
             else ["strategy.sma_window"] if kind == "sma_price"
             else ["strategy.rsi_window", "strategy.rsi_oversold", "strategy.rsi_overbought"] if kind == "rsi"
             else ["strategy.macd_fast_window", "strategy.macd_slow_window", "strategy.macd_signal_window"] if kind == "macd"
             else ["strategy.bb_window", "strategy.bb_k"] if kind == "bollinger"
+            else ["strategy.obv_span"] if kind == "obv"
+            else ["strategy.k_window", "strategy.d_window", "strategy.smooth_k", "strategy.vwap_window"] if kind == "stoch_vwap"
+            else ["strategy.tenkan", "strategy.kijun", "strategy.senkou_b", "strategy.shift"] if kind == "ichimoku"
             else []
         )
+
 
     active_params: list[ParamDef] = []
     for k in active_keys:
@@ -1177,46 +1487,7 @@ def parse_int_list(s: str) -> list[int]:
             seen.add(x)
     return uniq
 
-def add_volume_to_trades_table(
-    trades: pd.DataFrame,
-    md,  # MarketData
-    *,
-    volume_col: str = "Volume",
-    out_col: str = "volume",
-) -> pd.DataFrame:
-    """
-    Adds bar volume to each fill row using (timestamp, symbol) lookup.
-    trades must have columns: ['timestamp','symbol'].
-    """
-    if trades is None or trades.empty:
-        return trades
-    if "timestamp" not in trades.columns or "symbol" not in trades.columns:
-        return trades
 
-    tdf = trades.copy()
-    tdf["timestamp"] = pd.to_datetime(tdf["timestamp"], errors="coerce")
-    tdf = tdf.dropna(subset=["timestamp", "symbol"])
-
-    # Build a lookup table: (timestamp, symbol) -> volume
-    parts = []
-    for sym, bars in md.bars.items():
-        if volume_col not in bars.columns:
-            continue
-        b = bars[[volume_col]].copy()
-        b = b.sort_index()
-        b = b.reset_index().rename(columns={b.index.name or "index": "timestamp", volume_col: out_col})
-        b["timestamp"] = pd.to_datetime(b["timestamp"], errors="coerce")
-        b["symbol"] = sym
-        parts.append(b[["timestamp", "symbol", out_col]])
-
-    if not parts:
-        return tdf
-
-    vol_df = pd.concat(parts, ignore_index=True)
-    # Exact join on timestamp+symbol (your fills timestamp should match bars index)
-    tdf = tdf.merge(vol_df, on=["timestamp", "symbol"], how="left")
-
-    return tdf
 
 def _persist_upload_to_cache(uploaded_file, tag: str, symbol: str) -> tuple[str, str]:
     """
@@ -1315,8 +1586,16 @@ def plot_price_indicators_trades_line(
 
         if indicator_cols is not None:
             keep = [c for c in indicator_cols if c in ind.columns]
+
+            # Always keep any "known indicator families" if present, even if UI didn't request them.
+            prefixes = ("sma_", "ema_", "rsi_", "macd_", "std_", "vwap_", "stoch_", "ichimoku_")
+            keep += [c for c in ind.columns if c.startswith(prefixes)]
+            keep += [c for c in ind.columns if c == "obv" or c.startswith("obv_ema_")]
+
+            keep = sorted(set(keep))
             if keep:
                 ind = ind[keep]
+
 
     def _maybe_add_bollinger_overlay():
         nonlocal fig, df, ind, indicator_cols
@@ -1433,103 +1712,186 @@ def plot_price_indicators_trades_line(
         )
 
     # ----------------------------
-    # Detect RSI / MACD columns
+    # Detect panels / overlays
     # ----------------------------
-    rsi_cols: list[str] = []
-    macd_bases: list[str] = []
+    rsi_col: str | None = None
+    macd_base: str | None = None
+
+    obv_col: str | None = None
+    obv_ema_col: str | None = None
+
+    stoch_k_col: str | None = None
+    stoch_d_col: str | None = None
+    vwap_col: str | None = None
+
+    ich_tenkan_col: str | None = None
+    ich_kijun_col: str | None = None
+    ich_span_a_col: str | None = None
+    ich_span_b_col: str | None = None
+
     has_rsi = False
     has_macd = False
+    has_obv = False
+    has_stoch = False
 
+    has_ichimoku = False
+    has_vwap = False
 
     if ind is not None and not ind.empty:
         cols = list(ind.columns)
 
-        # RSI columns: rsi_{n}
+        # ---------- RSI ----------
         rsi_cols = [c for c in cols if c.startswith("rsi_")]
+        if rsi_cols:
+            # 1) strategy-driven choice
+            w = (strategy_params or {}).get("rsi_window", None)
+            if w is not None:
+                cand = f"rsi_{int(w)}"
+                if cand in ind.columns:
+                    rsi_col = cand
+            # 2) indicator_cols-driven choice
+            if rsi_col is None and indicator_cols:
+                for c in indicator_cols:
+                    if c in ind.columns and c.startswith("rsi_"):
+                        rsi_col = c
+                        break
+            # 3) fallback
+            if rsi_col is None:
+                rsi_col = rsi_cols[0]
 
-        # MACD base: macd_{fast}_{slow}_{sig} (but in DF you likely have __line/__signal/__hist)
-        # We'll infer unique "macd_{fast}_{slow}_{sig}" bases from columns.
+        # ---------- MACD ----------
+        macd_bases = []
         for c in cols:
             if c.startswith("macd_") and "__" in c:
                 base = c.split("__", 1)[0]
                 if base not in macd_bases:
                     macd_bases.append(base)
+        macd_base = macd_bases[0] if macd_bases else None
 
-        # Pick RSI column that matches strategy window (or indicator_cols), else fallback
-        rsi_col = None
-        if ind is not None and (not ind.empty):
-            rsi_cols = [c for c in ind.columns if c.startswith("rsi_")]
+        # ---------- OBV ----------
+        # Support both:
+        # - "obv" / "obv_ema_{span}" (optimizer bank)
+        # - "obv_*" from indicator engine (if you name it differently)
+        if "obv" in cols:
+            obv_col = "obv"
+        else:
+            obv_like = [c for c in cols if c.lower().startswith("obv")]
+            if obv_like:
+                obv_col = obv_like[0]
 
-            if rsi_cols:
-                # 1) strategy-driven choice
-                w = (strategy_params or {}).get("rsi_window", None)
-                if w is not None:
-                    cand = f"rsi_{int(w)}"
-                    if cand in ind.columns:
-                        rsi_col = cand
+        span = (strategy_params or {}).get("obv_span", None)
+        if span is not None and f"obv_ema_{int(span)}" in cols:
+            obv_ema_col = f"obv_ema_{int(span)}"
+        else:
+            ema_like = [c for c in cols if c.startswith("obv_ema_")]
+            if ema_like:
+                obv_ema_col = ema_like[0]
 
-                # 2) indicator_cols-driven choice (if provided)
-                if rsi_col is None and indicator_cols:
-                    for c in indicator_cols:
-                        if c in ind.columns and c.startswith("rsi_"):
-                            rsi_col = c
-                            break
+        # ---------- VWAP ----------
+        vwap_w = (strategy_params or {}).get("vwap_window", None)
+        if vwap_w is not None and f"vwap_{int(vwap_w)}" in cols:
+            vwap_col = f"vwap_{int(vwap_w)}"
+        else:
+            vwap_like = [c for c in cols if c.startswith("vwap_")]
+            if vwap_like:
+                vwap_col = vwap_like[0]
 
-                # 3) fallback: first available
-                if rsi_col is None:
-                    rsi_col = rsi_cols[0]
+        # ---------- Stochastic ----------
+        # Optimizer bank format: stoch_{k}_{d}_{smooth}__k / __d
+        k_w = (strategy_params or {}).get("k_window", None)
+        d_w = (strategy_params or {}).get("d_window", None)
+        s_k = (strategy_params or {}).get("smooth_k", None)
 
-            # MACD bases
-            macd_bases = []
-            for c in ind.columns:
-                if c.startswith("macd_") and "__" in c:
-                    base = c.split("__", 1)[0]
-                    if base not in macd_bases:
-                        macd_bases.append(base)
+        if k_w is not None and d_w is not None and s_k is not None:
+            base = f"stoch_{int(k_w)}_{int(d_w)}_{int(s_k)}"
+            cand_k = f"{base}__k"
+            cand_d = f"{base}__d"
+            if cand_k in cols and cand_d in cols:
+                stoch_k_col, stoch_d_col = cand_k, cand_d
 
-        # flags (ALWAYS defined because initialized above)
+        if stoch_k_col is None or stoch_d_col is None:
+            k_like = [c for c in cols if c.endswith("__k") and c.startswith("stoch_")]
+            d_like = [c for c in cols if c.endswith("__d") and c.startswith("stoch_")]
+            if k_like and d_like:
+                # choose first matching base
+                k0 = k_like[0]
+                base0 = k0.rsplit("__", 1)[0]
+                d0 = f"{base0}__d"
+                if d0 in cols:
+                    stoch_k_col, stoch_d_col = k0, d0
+
+        # ---------- Ichimoku ----------
+        # Optimizer bank format: ichimoku_{t}_{k}_{sb}_{shift}__tenkan/kijun/span_a/span_b
+        ten = (strategy_params or {}).get("tenkan", None)
+        kij = (strategy_params or {}).get("kijun", None)
+        sb  = (strategy_params or {}).get("senkou_b", None)
+        sh  = (strategy_params or {}).get("shift", None)
+
+        if ten is not None and kij is not None and sb is not None and sh is not None:
+            base = f"ichimoku_{int(ten)}_{int(kij)}_{int(sb)}_{int(sh)}"
+            cand_t = f"{base}__tenkan"
+            cand_k = f"{base}__kijun"
+            cand_a = f"{base}__span_a"
+            cand_b = f"{base}__span_b"
+            if cand_t in cols and cand_k in cols and cand_a in cols and cand_b in cols:
+                ich_tenkan_col, ich_kijun_col, ich_span_a_col, ich_span_b_col = cand_t, cand_k, cand_a, cand_b
+
+        if ich_tenkan_col is None:
+            # fallback: pick any ichimoku_* family if present
+            ten_like = [c for c in cols if c.endswith("__tenkan") and c.startswith("ichimoku_")]
+            if ten_like:
+                base0 = ten_like[0].rsplit("__", 1)[0]
+                cand_t = f"{base0}__tenkan"
+                cand_k = f"{base0}__kijun"
+                cand_a = f"{base0}__span_a"
+                cand_b = f"{base0}__span_b"
+                if cand_t in cols and cand_k in cols and cand_a in cols and cand_b in cols:
+                    ich_tenkan_col, ich_kijun_col, ich_span_a_col, ich_span_b_col = cand_t, cand_k, cand_a, cand_b
+
+        # flags
         has_rsi = (rsi_col is not None)
-        has_macd = (len(macd_bases) > 0)
+        has_macd = (macd_base is not None)
 
-        macd_base = macd_bases[0] if has_macd else None
-
+        has_obv = (obv_col is not None)
+        has_stoch = (stoch_k_col is not None and stoch_d_col is not None)
+        has_vwap = (vwap_col is not None)
+        has_ichimoku = (ich_tenkan_col is not None and ich_kijun_col is not None and ich_span_a_col is not None and ich_span_b_col is not None)
 
 
     # ----------------------------
     # Layout: rows depend on panels
     # ----------------------------
     # row 1: price
-    # optional row 2: RSI
-    # optional row 3: MACD
+    # optional mid rows: RSI, MACD, OBV, STOCH
     # last row: volume
-    n_mid = int(has_rsi) + int(has_macd)
-    n_rows = 2 + n_mid  # price + volume + middle panels
-
-    # heights: price biggest, then mid panels, then volume
-    # normalize later by relative weights
-    row_heights = []
-    row_heights.append(0.58)  # price
+    mid_panels: list[str] = []
     if has_rsi:
-        row_heights.append(0.20)
+        mid_panels.append("rsi")
     if has_macd:
-        row_heights.append(0.20)
-    row_heights.append(0.22)  # volume
+        mid_panels.append("macd")
+    if has_obv:
+        mid_panels.append("obv")
+    if has_stoch:
+        mid_panels.append("stoch")
 
-    # normalize to sum=1
+    n_mid = len(mid_panels)
+    n_rows = 2 + n_mid  # price + volume + mid panels
+
+    # heights
+    row_heights = [0.58]  # price
+    row_heights += [0.18] * n_mid
+    row_heights.append(0.24)  # volume
+
     s = sum(row_heights)
     row_heights = [h / s for h in row_heights]
 
-    # Determine which row is MACD row (if present)
+    # figure specs: we only need secondary_y for MACD (histogram)
+    specs = [[{"secondary_y": True}] for _ in range(n_rows)]
+    # find which row index (1-based) the macd panel lands on
     macd_row = None
-    tmp_row = 2
-    if has_rsi:
-        tmp_row += 1
-    if has_macd:
-        macd_row = tmp_row  # the current row where MACD panel is plotted
-
-    specs = [[{}] for _ in range(n_rows)]
-    if macd_row is not None:
-        specs[macd_row - 1][0] = {"secondary_y": True}  # plotly is 1-indexed rows
+    if "macd" in mid_panels:
+        macd_row = 2 + mid_panels.index("macd")  # row 2 is first mid
+        specs[macd_row - 1][0] = {"secondary_y": True}
 
     fig = make_subplots(
         rows=n_rows, cols=1,
@@ -1540,6 +1902,7 @@ def plot_price_indicators_trades_line(
     )
 
 
+
     # =========================
     # Row 1: Price + Trades
     # =========================
@@ -1548,6 +1911,64 @@ def plot_price_indicators_trades_line(
         row=1, col=1
     )
     _maybe_add_bollinger_overlay()
+    # VWAP overlay (price row) if present
+    if has_vwap and vwap_col is not None and ind is not None and vwap_col in ind.columns:
+        vwap = pd.to_numeric(ind[vwap_col], errors="coerce")
+        if vwap.notna().any():
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index, y=vwap,
+                    mode="lines",
+                    name=vwap_col,
+                    line=dict(width=1, dash="dot"),
+                ),
+                row=1, col=1
+            )
+        # Ichimoku overlay (price row) if present
+    if has_ichimoku and ind is not None:
+        tenkan = pd.to_numeric(ind[ich_tenkan_col], errors="coerce")
+        kijun  = pd.to_numeric(ind[ich_kijun_col], errors="coerce")
+        span_a = pd.to_numeric(ind[ich_span_a_col], errors="coerce")
+        span_b = pd.to_numeric(ind[ich_span_b_col], errors="coerce")
+
+        if tenkan.notna().any():
+            fig.add_trace(
+                go.Scatter(x=df.index, y=tenkan, mode="lines", name="Ichimoku Tenkan", line=dict(width=1)),
+                row=1, col=1
+            )
+        if kijun.notna().any():
+            fig.add_trace(
+                go.Scatter(x=df.index, y=kijun, mode="lines", name="Ichimoku Kijun", line=dict(width=1, dash="dash")),
+                row=1, col=1
+            )
+
+        # Cloud fill: plot span_a then span_b with tonexty fill
+        # (Plotly fill needs consecutive traces)
+        if span_a.notna().any() and span_b.notna().any():
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index, y=span_a,
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=1, col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index, y=span_b,
+                    mode="lines",
+                    fill="tonexty",
+                    line=dict(width=0),
+                    name="Ichimoku Cloud",
+                    opacity=0.12,
+                    hoverinfo="skip",
+                ),
+                row=1, col=1
+            )
+
+
     if ind is not None and not ind.empty:
         # Keep it conservative: only draw moving averages on the price panel
         price_level_cols = [c for c in ind.columns if c.startswith(("sma_", "ema_"))]
@@ -1627,42 +2048,116 @@ def plot_price_indicators_trades_line(
             )
 
 
+        # =========================
+    # Middle panels: RSI / MACD / OBV / STOCH
     # =========================
-    # Middle panels: RSI / MACD
-    # =========================
-    cur_row = 2  # first middle row
+    cur_row = 2
 
-    # ---- RSI panel ----
-    if has_rsi and rsi_col is not None:
-        rsi = pd.to_numeric(ind[rsi_col], errors="coerce")
+    for panel in mid_panels:
 
-        # main RSI line
-        fig.add_trace(
-            go.Scatter(x=df.index, y=rsi, mode="lines", name=rsi_col),
-            row=cur_row, col=1
-        )
+        # ---- RSI ----
+        if panel == "rsi" and has_rsi and rsi_col is not None:
+            rsi = pd.to_numeric(ind[rsi_col], errors="coerce")
 
-        # thresholds: prefer strategy_params (optimized) else fall back to function defaults
-        lo = float((strategy_params or {}).get("rsi_oversold", rsi_low))
-        hi = float((strategy_params or {}).get("rsi_overbought", rsi_high))
+            fig.add_trace(
+                go.Scatter(x=df.index, y=rsi, mode="lines", name=rsi_col),
+                row=cur_row, col=1
+            )
 
-        # guard: ensure lo < hi (avoid broken shading/lines if user misconfigures)
-        if lo >= hi:
-            lo, hi = min(lo, hi - 1e-9), hi  # or just set lo=30,hi=70; your choice
+            lo = float((strategy_params or {}).get("rsi_oversold", rsi_low))
+            hi = float((strategy_params or {}).get("rsi_overbought", rsi_high))
+            if lo >= hi:
+                lo, hi = 30.0, 70.0
 
-        # threshold lines
-        fig.add_hline(y=lo, line_width=1, line_dash="dash", row=cur_row, col=1)
-        fig.add_hline(y=hi, line_width=1, line_dash="dash", row=cur_row, col=1)
+            fig.add_hline(y=lo, line_width=1, line_dash="dash", row=cur_row, col=1)
+            fig.add_hline(y=hi, line_width=1, line_dash="dash", row=cur_row, col=1)
+            fig.add_hrect(y0=0, y1=lo, row=cur_row, col=1, opacity=0.12, line_width=0)
+            fig.add_hrect(y0=hi, y1=100, row=cur_row, col=1, opacity=0.12, line_width=0)
 
-        # shaded regions
-        fig.add_hrect(y0=0, y1=lo, row=cur_row, col=1, opacity=0.12, line_width=0)
-        fig.add_hrect(y0=hi, y1=100, row=cur_row, col=1, opacity=0.12, line_width=0)
+            fig.update_yaxes(range=[0, 100], title_text="RSI", row=cur_row, col=1)
+            cur_row += 1
+            continue
 
+        # ---- MACD ----
+        if panel == "macd" and has_macd and macd_base is not None:
+            line_col = f"{macd_base}__line"
+            sig_col  = f"{macd_base}__signal"
+            hist_col = f"{macd_base}__hist"
 
-        # keep RSI scale consistent
-        fig.update_yaxes(range=[0, 100], title_text="RSI", row=cur_row, col=1)
+            line = pd.to_numeric(ind.get(line_col), errors="coerce")
+            sigl = pd.to_numeric(ind.get(sig_col), errors="coerce")
+            hist = pd.to_numeric(ind[hist_col], errors="coerce") if (hist_col in ind.columns) else (line - sigl)
 
-        cur_row += 1
+            fig.add_trace(
+                go.Scatter(x=df.index, y=line, mode="lines", name=f"{macd_base} line"),
+                row=cur_row, col=1, secondary_y=False
+            )
+            fig.add_trace(
+                go.Scatter(x=df.index, y=sigl, mode="lines", name=f"{macd_base} signal"),
+                row=cur_row, col=1, secondary_y=False
+            )
+
+            h = hist.fillna(0.0).astype(float)
+            bar_colors = np.where(h >= 0, "rgba(0,180,0,0.6)", "rgba(200,0,0,0.6)")
+            fig.add_trace(
+                go.Bar(x=df.index, y=h.values, name=f"{macd_base} hist", marker=dict(color=bar_colors)),
+                row=cur_row, col=1, secondary_y=True
+            )
+            fig.add_trace(
+                go.Scatter(x=df.index, y=np.zeros(len(df.index)), mode="lines", showlegend=False),
+                row=cur_row, col=1, secondary_y=True
+            )
+
+            fig.update_yaxes(title_text="MACD", row=cur_row, col=1, secondary_y=False)
+            fig.update_yaxes(title_text="Hist", row=cur_row, col=1, secondary_y=True)
+            cur_row += 1
+            continue
+
+        # ---- OBV ----
+        if panel == "obv" and has_obv and obv_col is not None:
+            obv = pd.to_numeric(ind[obv_col], errors="coerce")
+
+            fig.add_trace(
+                go.Scatter(x=df.index, y=obv, mode="lines", name="OBV"),
+                row=cur_row, col=1
+            )
+
+            if obv_ema_col is not None and obv_ema_col in ind.columns:
+                obv_ema = pd.to_numeric(ind[obv_ema_col], errors="coerce")
+                if obv_ema.notna().any():
+                    fig.add_trace(
+                        go.Scatter(x=df.index, y=obv_ema, mode="lines", name=obv_ema_col, line=dict(width=1, dash="dash")),
+                        row=cur_row, col=1
+                    )
+
+            fig.update_yaxes(title_text="OBV", row=cur_row, col=1)
+            cur_row += 1
+            continue
+
+        # ---- STOCH ----
+        if panel == "stoch" and has_stoch and stoch_k_col is not None and stoch_d_col is not None:
+            k = pd.to_numeric(ind[stoch_k_col], errors="coerce")
+            d = pd.to_numeric(ind[stoch_d_col], errors="coerce")
+
+            fig.add_trace(
+                go.Scatter(x=df.index, y=k, mode="lines", name="%K"),
+                row=cur_row, col=1
+            )
+            fig.add_trace(
+                go.Scatter(x=df.index, y=d, mode="lines", name="%D", line=dict(width=1, dash="dash")),
+                row=cur_row, col=1
+            )
+
+            # Standard bands
+            fig.add_hline(y=20, line_width=1, line_dash="dash", row=cur_row, col=1)
+            fig.add_hline(y=80, line_width=1, line_dash="dash", row=cur_row, col=1)
+            fig.add_hrect(y0=0, y1=20, row=cur_row, col=1, opacity=0.12, line_width=0)
+            fig.add_hrect(y0=80, y1=100, row=cur_row, col=1, opacity=0.12, line_width=0)
+
+            fig.update_yaxes(range=[0, 100], title_text="Stoch", row=cur_row, col=1)
+            cur_row += 1
+            continue
+
 
     # ---- MACD panel ----
     if has_macd and macd_base is not None:
@@ -1979,10 +2474,7 @@ def render_bundle(bundle, *, port_cfg: PortfolioConfig | None = None, label : st
     if "trades" in tables:
         trades_df = tables["trades"]
 
-        # pick the right volume column name
-        vcol = getattr(port_cfg, "volume_col", "Volume") if port_cfg is not None else "Volume"
 
-        trades_df = add_volume_to_trades_table(trades_df, bundle.md, volume_col=vcol, out_col="volume")
 
         # optional: choose visible columns order
         cols_first = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","volume"] if c in trades_df.columns]
@@ -1993,8 +2485,8 @@ def render_bundle(bundle, *, port_cfg: PortfolioConfig | None = None, label : st
 
 
     st.subheader("Trade Ledger (PnL per closed trade)")
-    if "trade_ledger" in tables:
-        st.dataframe(tables["trade_ledger"], use_container_width=True)
+    if "trades" in tables:
+        st.dataframe(tables["trades"], use_container_width=True)
 
     st.subheader("Trade Performance (summary)")
     if "trade_performance" in tables:
@@ -2225,7 +2717,7 @@ else:
     yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
 
 st.sidebar.header("Strategy")
-strategy_kind = st.sidebar.selectbox("Strategy kind", ["ma_cross", "sma_price", "rsi", "macd", "bollinger"], index=0)
+strategy_kind = st.sidebar.selectbox("Strategy kind", ["ma_cross", "sma_price", "rsi", "macd", "bollinger","obv", "stoch_vwap", "ichimoku"], index=0)
 allow_short = st.sidebar.checkbox("Allow short", value=False)
 
 # Reset optimization UI on strategy change (prevents stale widget keys)
@@ -2250,7 +2742,7 @@ compare_params = {}
 if compare_mode == "Another strategy (same data)":
     compare_strategy_kind = st.sidebar.selectbox(
         "Comparator strategy kind",
-        ["buy_hold", "ma_cross", "sma_price", "rsi", "macd", "bollinger"],
+        ["buy_hold", "ma_cross", "sma_price", "rsi", "macd", "bollinger","obv", "stoch_vwap", "ichimoku"],
         index=0,
         key="cmp_kind",
     )
@@ -2505,7 +2997,92 @@ with tab_backtest:
                 "allow_short": bool(allow_short),
                 "nan_policy": nan_policy,
             }
+        elif strategy_kind == "obv":
+            obv_span = st.number_input(
+                "OBV EMA span",
+                min_value=2, max_value=500,
+                value=20, step=1,
+                help="EMA span applied to OBV (option 1: OBV > EMA(OBV) => buy)."
+            )
+            strategy_params = {
+                "obv_span": int(obv_span),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy,
+            }
+        elif strategy_kind == "stoch_vwap":
+            c1, c2 = st.columns(2)
 
+            with c1:
+                k_window = st.number_input(
+                    "%K window",
+                    min_value=2, max_value=200,
+                    value=14, step=1,
+                    help="Lookback for HighestHigh/LowestLow used in %K."
+                )
+                d_window = st.number_input(
+                    "%D window (SMA of %K)",
+                    min_value=1, max_value=50,
+                    value=3, step=1,
+                    help="Smoothing window applied to %K."
+                )
+
+            with c2:
+                smooth_k = st.number_input(
+                    "%K smoothing",
+                    min_value=1, max_value=20,
+                    value=1, step=1,
+                    help="Optional smoothing of %K prior to computing %D. Keep 1 for classic."
+                )
+                vwap_window = st.number_input(
+                    "VWAP window (rolling, daily proxy)",
+                    min_value=2, max_value=500,
+                    value=20, step=1,
+                    help="Rolling VWAP proxy using typical price (H+L+C)/3 and volume."
+                )
+
+            # Optional: show the rules to avoid user confusion (institutional UX)
+            with st.expander("Signal logic (Stoch + VWAP)", expanded=False):
+                st.markdown(
+                    """
+                    **BUY**
+                    1) %K crosses above %D, %K and %D < 20, and Close > VWAP  
+                    2) 50 < %K,%D < 80 and Close crosses above VWAP  
+                    3) %K crosses above %D, %K and %D < 80, and Close > VWAP  
+
+                    **SELL**
+                    1) %K crosses below %D, %K and %D > 80, and Close < VWAP  
+                    2) 20 < %K,%D < 50 and Close crosses below VWAP  
+                    3) %K crosses below %D, %K and %D > 20, and Close < VWAP  
+
+                    **Precedence:** SELL overrides BUY if both trigger on the same bar.
+                    """
+                )
+
+            strategy_params = {
+                "k_window": int(k_window),
+                "d_window": int(d_window),
+                "smooth_k": int(smooth_k),
+                "vwap_window": int(vwap_window),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy,
+            }
+        elif strategy_kind == "ichimoku":
+            c1, c2 = st.columns(2)
+            with c1:
+                tenkan = st.number_input("Tenkan window", min_value=2, max_value=200, value=9, step=1)
+                kijun  = st.number_input("Kijun window",  min_value=2, max_value=400, value=26, step=1)
+            with c2:
+                senkou_b = st.number_input("Senkou B window", min_value=2, max_value=600, value=52, step=1)
+                shift    = st.number_input("Shift (forward)", min_value=1, max_value=200, value=26, step=1)
+
+            strategy_params = {
+                "tenkan": int(tenkan),
+                "kijun": int(kijun),
+                "senkou_b": int(senkou_b),
+                "shift": int(shift),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy,
+            }
         
         st.markdown("### Portfolio")
         initial_cash = st.number_input("Initial cash", min_value=1_000.0, value=100_000.0, step=10_000.0)
@@ -2558,7 +3135,7 @@ with tab_backtest:
         if lb_enable:
             lb_kinds = st.multiselect(
                 "Select strategies to compare",
-                options=["buy_hold", "ma_cross", "sma_price", "rsi", "macd", "bollinger"],
+                options=["buy_hold", "ma_cross", "sma_price", "rsi", "macd", "bollinger","obv", "stoch_vwap", "ichimoku"],
                 default=["buy_hold", strategy_kind],
             )
 
@@ -2807,7 +3384,29 @@ with tab_backtest:
 
                     bundles[k] = bundle_k
                     name = f"{k}"
-                    rows.append(leaderboard_row_from_report(bundle_k.report, name=name))
+                    row = leaderboard_row_from_report(bundle_k.report, name=name)
+
+                    # --- compute last-bar signal for THIS strategy ---
+                    sym0 = bundle_k.md.symbols()[0]
+                    bars_k = bundle_k.md.bars[sym0]
+                    pp_k = bundle_k.report.plots.get("price_panel", {})
+                    ind_k = pp_k.get("indicators")
+
+                    sig_date, sig_num, sig_lab = latest_signal_from_kind(
+                        kind=k,
+                        bars=bars_k,
+                        indicators=ind_k,
+                        params=spec_k.strategy.params,
+                    )
+
+                    row["Signal Date"] = sig_date.date().isoformat() if sig_date is not None else None
+                    row["Signal"] = sig_lab
+                    row["Signal (-1/0/+1)"] = int(sig_num)
+
+                    row["Best Params"] = format_params_for_table(spec_k.strategy.params)
+
+                    rows.append(row)
+
 
             df_lb = pd.DataFrame(rows)
 
@@ -2888,6 +3487,43 @@ with tab_opt:
             window = st.number_input("BB window (baseline)", min_value=2, max_value=500, value=20, step=1, key="opt_bb_window0")
             k = st.number_input("BB k (std dev multiplier) (baseline)", min_value=0.1, max_value=5.0, value=2.0, step=0.1, key="opt_bb_k0")
             strategy_params0 = {"bb_window": int(window), "bb_k": float(k), "allow_short": bool(allow_short), "nan_policy": nan_policy0}
+        elif strategy_kind == "obv":
+            obv_span0 = st.number_input("OBV EMA span (baseline)", min_value=2, max_value=500, value=20, step=1, key="opt_obv_span0")
+            strategy_params0 = {"obv_span": int(obv_span0), "allow_short": bool(allow_short), "nan_policy": nan_policy0}
+        elif strategy_kind == "stoch_vwap":
+            c1, c2 = st.columns(2)
+            with c1:
+                k_window0 = st.number_input("Stoch %K window (baseline)", min_value=2, max_value=200, value=14, step=1, key="opt_k_window0")
+                d_window0 = st.number_input("Stoch %D window (baseline)", min_value=1, max_value=50, value=3, step=1, key="opt_d_window0")
+            with c2:
+                smooth_k0 = st.number_input("Stoch %K smoothing (baseline)", min_value=1, max_value=20, value=1, step=1, key="opt_smooth_k0")
+                vwap_window0 = st.number_input("VWAP window (baseline)", min_value=2, max_value=500, value=20, step=1, key="opt_vwap_window0")
+
+            strategy_params0 = {
+                "k_window": int(k_window0),
+                "d_window": int(d_window0),
+                "smooth_k": int(smooth_k0),
+                "vwap_window": int(vwap_window0),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy0,
+            }
+        elif strategy_kind == "ichimoku":
+            c1, c2 = st.columns(2)
+            with c1:
+                tenkan0 = st.number_input("Tenkan window (baseline)", min_value=2, max_value=200, value=9, step=1, key="opt_tenkan0")
+                kijun0  = st.number_input("Kijun window (baseline)",  min_value=2, max_value=400, value=26, step=1, key="opt_kijun0")
+            with c2:
+                senkou_b0 = st.number_input("Senkou B window (baseline)", min_value=2, max_value=600, value=52, step=1, key="opt_senkou_b0")
+                shift0    = st.number_input("Shift (forward) (baseline)", min_value=1, max_value=200, value=26, step=1, key="opt_shift0")
+
+            strategy_params0 = {
+                "tenkan": int(tenkan0),
+                "kijun": int(kijun0),
+                "senkou_b": int(senkou_b0),
+                "shift": int(shift0),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy0,
+            }
 
         min_ret0 = st.slider("Min return before sell baseline (%)", 0.0, 50.0, 0.0, 0.1, key="opt_min_ret0") / 100.0
 
@@ -2969,6 +3605,9 @@ with tab_opt:
         else ["strategy.rsi_window", "strategy.rsi_oversold", "strategy.rsi_overbought"] if strategy_kind == "rsi"
         else ["strategy.macd_fast_window", "strategy.macd_slow_window", "strategy.macd_signal_window"] if strategy_kind == "macd"
         else ["strategy.bb_window", "strategy.bb_k"] if strategy_kind == "bollinger"
+        else ["strategy.obv_span"] if strategy_kind == "obv"
+        else ["strategy.k_window", "strategy.d_window", "strategy.smooth_k", "strategy.vwap_window"] if strategy_kind == "stoch_vwap"
+        else ["strategy.tenkan", "strategy.kijun", "strategy.senkou_b", "strategy.shift"] if strategy_kind == "ichimoku"
         else []
     )
 
@@ -3126,11 +3765,11 @@ with tab_opt:
     )
 
     if opt_scope == "All selected strategies (leaderboard)":
-        ALL_KINDS = ["buy_hold", "ma_cross", "sma_price", "rsi", "macd", "bollinger"]
+        ALL_KINDS = ["buy_hold", "ma_cross", "sma_price", "rsi", "macd", "bollinger", "obv", "stoch_vwap", "ichimoku"]
         lb_opt_kinds = st.multiselect(
             "Strategies to optimize/compare",
             options=ALL_KINDS,
-            default=["buy_hold", "ma_cross", "sma_price", "rsi", "macd", "bollinger"],
+            default=["buy_hold", "ma_cross", "sma_price", "rsi", "macd", "bollinger", "obv", "stoch_vwap", "ichimoku"],
             key="opt_lb_kinds",
         )
         st.markdown("### Per-strategy optimization domains")
@@ -3296,7 +3935,7 @@ with tab_opt:
                 volume_gate=volume_gate_spec,
                 participation_cap=participation_cap_spec,
                 domains_by_kind=domains_by_kind,
-                app_version="v2_signals_ledgers",
+                app_version="v3_signals_ledgers",
             )
 
             run_id = run_id_from_spec(run_spec)
@@ -3618,7 +4257,7 @@ with tab_opt:
                 # Sort: higher is better for your metrics (Max Drawdown is negative, closer to 0 = higher = better)
                 df_lb = df_lb.sort_values(rank_metric, ascending=False, na_position="last").reset_index(drop=True)
 
-                top5_df = df_lb.head(5).copy()
+                top5_df = df_lb.head(7).copy()
 
                 st.subheader("Optimized strategies leaderboard")
                 front = [c for c in ["Strategy", "Signal", "Signal Date", "CAGR", "PnL"] if c in df_lb.columns]
@@ -3931,7 +4570,7 @@ with tab_opt:
 
 
             if ranked_df is not None and isinstance(ranked_df, pd.DataFrame) and (not ranked_df.empty):
-                best5_df = ranked_df.head(5)
+                best5_df = ranked_df.head(7)
                 worst5_df = ranked_df.tail(5).sort_values(["pnl","cagr"], ascending=[True, True]).reset_index(drop=True)
                 mid_start = max(0, (len(ranked_df) // 2) - 2)
                 mid5_df = ranked_df.iloc[mid_start: mid_start + 5].reset_index(drop=True)
@@ -3955,13 +4594,13 @@ with tab_opt:
                         if cmp_spec is not None:
                             bundle_b = BacktestEngine(cmp_spec).run()
 
-                        st.dataframe(bundle_a.report.tables.get("trade_ledger", pd.DataFrame()), use_container_width=True)
+                        st.dataframe(bundle_a.report.tables.get("trades", pd.DataFrame()), use_container_width=True)
                         st.dataframe(bundle_a.report.tables.get("trades", pd.DataFrame()), use_container_width=True)
                         st.dataframe(bundle_a.report.tables.get("trade_performance", pd.DataFrame()), use_container_width=True)
 
                         if bundle_b is not None:
                             st.subheader(f"Compare with {cmp_spec.strategy.kind}")
-                            st.dataframe(bundle_b.report.tables.get("trade_ledger", pd.DataFrame()), use_container_width=True)
+                            st.dataframe(bundle_b.report.tables.get("trades", pd.DataFrame()), use_container_width=True)
                             st.dataframe(bundle_b.report.tables.get("trades", pd.DataFrame()), use_container_width=True)
                             st.dataframe(bundle_b.report.tables.get("trade_performance", pd.DataFrame()), use_container_width=True)
 

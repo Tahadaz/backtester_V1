@@ -32,7 +32,9 @@ from strategy import (
     BollingerParams,
     BuyHoldStrategy,
     BuyHoldParams,
-
+    OBVStrategy, OBVParams,
+    StochVWAPStrategy, StochVWAPParams,
+    IchimokuStrategy, IchimokuParams,
 )
 from portfolio import PortfolioEngine, PortfolioConfig, PortfolioResult
 from results import ResultsAnalyzer, BacktestReport
@@ -40,7 +42,7 @@ from strategy import default_plot_indicators  # add import
 
 
 DataSourceKind = Literal["bmce", "yfinance"]
-StrategyKind = Literal["ma_cross","sma_price", "rsi","macd","bollinger", "buy_hold"]  # add more as you implement them'"]
+StrategyKind = Literal["ma_cross","sma_price", "rsi","macd","bollinger", "buy_hold","obv","stoch_vwap","ichimoku"]  # add more as you implement them'"]
 def slice_df_by_start_end(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -344,6 +346,37 @@ def build_strategy(kind: str, params: Dict[str, Any]):
             nan_policy=str(params.get("nan_policy", "flat")),
         )
         return BuyHoldStrategy(p)
+    
+    if k == "obv":
+        p = OBVParams(
+            obv_span=int(params.get("obv_span", params.get("span", 20))),
+            allow_short=bool(params.get("allow_short", False)),
+            nan_policy=str(params.get("nan_policy", "flat")),
+        )
+        return OBVStrategy(p)
+
+    if k == "stoch_vwap":
+        p = StochVWAPParams(
+            k_window=int(params.get("k_window", 14)),
+            d_window=int(params.get("d_window", 3)),
+            smooth_k=int(params.get("smooth_k", 1)),
+            vwap_window=int(params.get("vwap_window", 20)),
+            allow_short=bool(params.get("allow_short", False)),
+            nan_policy=str(params.get("nan_policy", "flat")),
+        )
+        return StochVWAPStrategy(p)
+
+    if k == "ichimoku":
+        p = IchimokuParams(
+            tenkan=int(params.get("tenkan", 9)),
+            kijun=int(params.get("kijun", 26)),
+            senkou_b=int(params.get("senkou_b", 52)),
+            shift=int(params.get("shift", 26)),
+            allow_short=bool(params.get("allow_short", False)),
+            nan_policy=str(params.get("nan_policy", "flat")),
+        )
+        return IchimokuStrategy(p)
+
 
 
     raise ValueError(f"Unknown strategy kind: {kind}")
@@ -781,6 +814,26 @@ def estimate_warmup_bars_from_params(spec: EngineSpec, active_params: list) -> i
         w = int(p.get("bb_window", 20))
         w = _max_in_paramdef("strategy.bb_window", w)
         warm = max(warm, w)
+
+    elif k == "obv":
+        span = int(p.get("obv_span", p.get("span", 20)))
+        # +1 for diff/initialization; keep conservative
+        warm = max(warm, span + 1)
+
+    elif k == "stoch_vwap":
+        kw = int(p.get("k_window", 14))
+        dw = int(p.get("d_window", 3))
+        sk = int(p.get("smooth_k", 1))
+        vw = int(p.get("vwap_window", 20))
+        warm = max(warm, max(kw, dw, sk, vw) + 1)
+
+    elif k == "ichimoku":
+        ten = int(p.get("tenkan", 9))
+        kij = int(p.get("kijun", 26))
+        sb  = int(p.get("senkou_b", 52))
+        sh  = int(p.get("shift", 26))
+        warm = max(warm, sb + sh)
+
 
     # --- portfolio warmup (ADV windows) ---
     port = spec.portfolio

@@ -69,12 +69,18 @@ class TrialResult:
     
 @dataclass
 class BankRequest:
+    # Existing
     sma: set[int] = field(default_factory=set)
     rsi: set[int] = field(default_factory=set)
     ema: set[int] = field(default_factory=set)
-    macd: set[tuple[int,int,int]] = field(default_factory=set)
-    std: set[int] = field(default_factory=set)   # NEW: rolling std windows
+    macd: set[tuple[int, int, int]] = field(default_factory=set)
+    std: set[int] = field(default_factory=set)   # rolling std windows
 
+    # New
+    obv_ema: set[int] = field(default_factory=set)                 # EMA spans applied to OBV
+    vwap: set[int] = field(default_factory=set)                    # rolling VWAP windows
+    stoch: set[tuple[int, int, int]] = field(default_factory=set)  # (k_window, d_window, smooth_k)
+    ichimoku: set[tuple[int, int, int, int]] = field(default_factory=set)  # (tenkan, kijun, senkou_b, shift)
 
     def merge(self, other: "BankRequest") -> "BankRequest":
         self.sma |= other.sma
@@ -82,7 +88,15 @@ class BankRequest:
         self.ema |= other.ema
         self.macd |= other.macd
         self.std |= other.std
+
+        self.obv_ema |= other.obv_ema
+        self.vwap |= other.vwap
+        self.stoch |= other.stoch
+        self.ichimoku |= other.ichimoku
         return self
+
+
+
 
 def rolling_std_cumsum(close: np.ndarray, w: int) -> np.ndarray:
     x = np.asarray(close, np.float64)
@@ -180,6 +194,9 @@ def _latest_signal_for_params(
     index: pd.DatetimeIndex,
     bank: Dict[str, Dict[str, np.ndarray]],
     bars_close: Dict[str, np.ndarray],
+    bars_high: Dict[str, np.ndarray],
+    bars_low: Dict[str, np.ndarray],
+    bars_vol: Dict[str, np.ndarray],
     params: Dict[str, Any],
 ) -> Tuple[pd.Timestamp, float, str]:
     """
@@ -193,6 +210,9 @@ def _latest_signal_for_params(
         index=index,
         bank=bank,
         bars_close=bars_close,
+        bars_high=bars_high,
+        bars_low=bars_low,
+        bars_vol=bars_vol,
         params=params,
         base_spec=base_spec,
     )
@@ -212,6 +232,97 @@ def _latest_signal_for_params(
 
     label = _signal_to_label(sig_val)
     return signal_date, float(sig_val) if sig_val is not None else float("nan"), label
+def obv_array(close: np.ndarray, vol: np.ndarray) -> np.ndarray:
+    c = np.asarray(close, np.float64)
+    v = np.asarray(vol, np.float64)
+    n = c.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return out
+    out[0] = 0.0
+    dc = np.diff(c)
+    sign = np.sign(dc)  # +1,0,-1
+    inc = sign * v[1:]
+    out[1:] = np.cumsum(inc)
+    return out
+
+
+def rolling_vwap_array(high: np.ndarray, low: np.ndarray, close: np.ndarray, vol: np.ndarray, window: int) -> np.ndarray:
+    h = np.asarray(high, np.float64)
+    l = np.asarray(low, np.float64)
+    c = np.asarray(close, np.float64)
+    v = np.asarray(vol, np.float64)
+
+    n = c.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    if window <= 0 or n < window:
+        return out
+
+    tp = (h + l + c) / 3.0
+    pv = tp * v
+
+    # rolling sums via cumulative sums
+    c_pv = np.cumsum(np.insert(pv, 0, 0.0))
+    c_v  = np.cumsum(np.insert(v, 0, 0.0))
+
+    num = c_pv[window:] - c_pv[:-window]
+    den = c_v[window:] - c_v[:-window]
+    den = np.where(den == 0.0, np.nan, den)
+
+    out[window-1:] = num / den
+    return out
+
+
+def stoch_kd_arrays(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    k_window: int,
+    d_window: int,
+    smooth_k: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    # Use pandas rolling for correctness/stability (acceptable compute for n_trials scale)
+    idx = pd.RangeIndex(len(close))
+    h = pd.Series(np.asarray(high, np.float64), index=idx)
+    l = pd.Series(np.asarray(low, np.float64), index=idx)
+    c = pd.Series(np.asarray(close, np.float64), index=idx)
+
+    hh = h.rolling(k_window, min_periods=k_window).max()
+    ll = l.rolling(k_window, min_periods=k_window).min()
+    denom = (hh - ll).replace(0.0, np.nan)
+
+    k = 100.0 * (c - ll) / denom
+    if smooth_k and smooth_k > 1:
+        k = k.rolling(smooth_k, min_periods=smooth_k).mean()
+    d = k.rolling(d_window, min_periods=d_window).mean()
+
+    return k.to_numpy(np.float64), d.to_numpy(np.float64)
+
+
+def ichimoku_arrays(
+    high: np.ndarray,
+    low: np.ndarray,
+    tenkan: int,
+    kijun: int,
+    senkou_b: int,
+    shift: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    idx = pd.RangeIndex(len(high))
+    h = pd.Series(np.asarray(high, np.float64), index=idx)
+    l = pd.Series(np.asarray(low, np.float64), index=idx)
+
+    tenkan_line = (h.rolling(tenkan, min_periods=tenkan).max() + l.rolling(tenkan, min_periods=tenkan).min()) / 2.0
+    kijun_line  = (h.rolling(kijun,  min_periods=kijun ).max() + l.rolling(kijun,  min_periods=kijun ).min()) / 2.0
+
+    span_a = ((tenkan_line + kijun_line) / 2.0).shift(shift)
+    span_b = ((h.rolling(senkou_b, min_periods=senkou_b).max() + l.rolling(senkou_b, min_periods=senkou_b).min()) / 2.0).shift(shift)
+
+    return (
+        tenkan_line.to_numpy(np.float64),
+        kijun_line.to_numpy(np.float64),
+        span_a.to_numpy(np.float64),
+        span_b.to_numpy(np.float64),
+    )
 
 def rsi_wilder(close: np.ndarray, window: int) -> np.ndarray:
     x = np.asarray(close, np.float64)
@@ -248,12 +359,16 @@ def macd_pack(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.
     hist = macd_line - sig_line
     return macd_line, sig_line, hist
 
-
-def build_bank(close_by_sym: Dict[str, np.ndarray], req: BankRequest) -> Dict[str, Dict[str, np.ndarray]]:
+def build_bank(
+    close_by_sym: Dict[str, np.ndarray],
+    high_by_sym: Dict[str, np.ndarray],
+    low_by_sym: Dict[str, np.ndarray],
+    vol_by_sym: Dict[str, np.ndarray],
+    req: BankRequest
+) -> Dict[str, Dict[str, np.ndarray]]:
     bank: Dict[str, Dict[str, np.ndarray]] = {sym: {} for sym in close_by_sym}
 
-    # If MACD requested, we *implicitly* need EMA(close, fast/slow)
-    # We can expand req.ema here (optional, but clean).
+    # If MACD requested, we implicitly need EMA(close, fast/slow)
     if req.macd:
         for (f, s, _g) in req.macd:
             req.ema.add(int(f))
@@ -270,27 +385,77 @@ def build_bank(close_by_sym: Dict[str, np.ndarray], req: BankRequest) -> Dict[st
         for w in sorted(req.rsi):
             sym_bank[f"rsi_{int(w)}"] = rsi_wilder(close, int(w))
 
-        # ---- EMA (explicit requests) ----
-        # keep an EMA cache so MACD can reuse it too
+        # ---- EMA(close) ----
         ema_close_cache: Dict[int, np.ndarray] = {}
         for span in sorted(req.ema):
             span = int(span)
             ema_close_cache[span] = ema(close, span)
-            sym_bank[f"ema_{span}"] = ema_close_cache[span]  # optional: store
+            sym_bank[f"ema_{span}"] = ema_close_cache[span]
 
-        # ---- MACD (reuses EMA(close, span)) ----
+        # ---- MACD ----
         for (f, s, g) in sorted(req.macd):
             f, s, g = int(f), int(s), int(g)
             m, ms, h = macd_pack_cached(close, f, s, g, ema_close_cache)
             sym_bank[f"macd_{f}_{s}_{g}"] = m
             sym_bank[f"macd_signal_{f}_{s}_{g}"] = ms
             sym_bank[f"macd_hist_{f}_{s}_{g}"] = h
+
         # ---- Rolling STD ----
         for w in sorted(req.std):
             sym_bank[f"std_{int(w)}"] = rolling_std_cumsum(close, int(w))
 
+        # -------------------------
+        # OBV + EMA(OBV)
+        # -------------------------
+        if req.obv_ema:
+            if "obv" not in sym_bank:
+                sym_bank["obv"] = obv_array(close_by_sym[sym], vol_by_sym[sym])
+            obv = sym_bank["obv"]
+            for span in sorted(req.obv_ema):
+                sym_bank[f"obv_ema_{int(span)}"] = ema(obv, int(span))
+
+        # -------------------------
+        # Rolling VWAP (daily proxy)
+        # -------------------------
+        if req.vwap:
+            for w in sorted(req.vwap):
+                w = int(w)
+                sym_bank[f"vwap_{w}"] = rolling_vwap_array(
+                    high_by_sym[sym], low_by_sym[sym], close_by_sym[sym], vol_by_sym[sym], w
+                )
+
+        # -------------------------
+        # Stochastic %K/%D
+        # -------------------------
+        if req.stoch:
+            for (k_w, d_w, s_k) in sorted(req.stoch):
+                k_w, d_w, s_k = int(k_w), int(d_w), int(s_k)
+                k, d = stoch_kd_arrays(
+                    high_by_sym[sym], low_by_sym[sym], close_by_sym[sym],
+                    k_window=k_w, d_window=d_w, smooth_k=s_k
+                )
+                key = f"stoch_{k_w}_{d_w}_{s_k}"
+                sym_bank[f"{key}__k"] = k
+                sym_bank[f"{key}__d"] = d
+
+        # -------------------------
+        # Ichimoku
+        # -------------------------
+        if req.ichimoku:
+            for (ten, kij, sb, sh) in sorted(req.ichimoku):
+                ten, kij, sb, sh = int(ten), int(kij), int(sb), int(sh)
+                tenkan_line, kijun_line, span_a, span_b = ichimoku_arrays(
+                    high_by_sym[sym], low_by_sym[sym],
+                    tenkan=ten, kijun=kij, senkou_b=sb, shift=sh
+                )
+                key = f"ichimoku_{ten}_{kij}_{sb}_{sh}"
+                sym_bank[f"{key}__tenkan"] = tenkan_line
+                sym_bank[f"{key}__kijun"] = kijun_line
+                sym_bank[f"{key}__span_a"] = span_a
+                sym_bank[f"{key}__span_b"] = span_b
 
     return bank
+
 
 
 # ============================================================
@@ -310,10 +475,15 @@ class StrategyAdapter:
         index: pd.DatetimeIndex,
         bank: Dict[str, Dict[str, np.ndarray]],
         bars_close: Dict[str, np.ndarray],
+        bars_high: Dict[str, np.ndarray],
+        bars_low: Dict[str, np.ndarray],
+        bars_vol: Dict[str, np.ndarray],
         params: Dict[str, Any],
         base_spec: EngineSpec,
     ) -> SignalFrame:
-        raise NotImplementedError
+        raise NotImplementedError(f"{self.kind}: make_signals_from_bank not implemented")
+
+
 
     def validate_params(self, params: Dict[str, Any], base_spec: EngineSpec) -> Tuple[bool, Optional[str]]:
         return True, None
@@ -349,6 +519,9 @@ class MACrossAdapter(StrategyAdapter):
         index: pd.DatetimeIndex,
         bank: Dict[str, Dict[str, np.ndarray]],
         bars_close: Dict[str, np.ndarray],
+        bars_high: Dict[str, np.ndarray],
+        bars_low: Dict[str, np.ndarray],
+        bars_vol: Dict[str, np.ndarray],
         params: Dict[str, Any],
         base_spec: EngineSpec,
     ) -> SignalFrame:
@@ -424,6 +597,9 @@ class PriceAboveSMAAdapter(StrategyAdapter):
         index: pd.DatetimeIndex,
         bank: Dict[str, Dict[str, np.ndarray]],
         bars_close: Dict[str, np.ndarray],
+        bars_high: Dict[str, np.ndarray],
+        bars_low: Dict[str, np.ndarray],
+        bars_vol: Dict[str, np.ndarray],
         params: Dict[str, Any],
         base_spec: EngineSpec,
     ) -> SignalFrame:
@@ -501,6 +677,9 @@ class RSIStrategyAdapter(StrategyAdapter):
         index: pd.DatetimeIndex,
         bank: Dict[str, Dict[str, np.ndarray]],
         bars_close: Dict[str, np.ndarray],
+        bars_high: Dict[str, np.ndarray],
+        bars_low: Dict[str, np.ndarray],
+        bars_vol: Dict[str, np.ndarray],
         params: Dict[str, Any],
         base_spec: EngineSpec,
     ) -> SignalFrame:
@@ -592,6 +771,9 @@ class MACDStrategyAdapter(StrategyAdapter):
         index: pd.DatetimeIndex,
         bank: Dict[str, Dict[str, np.ndarray]],
         bars_close: Dict[str, np.ndarray],
+        bars_high: Dict[str, np.ndarray],
+        bars_low: Dict[str, np.ndarray],
+        bars_vol: Dict[str, np.ndarray],
         params: Dict[str, Any],
         base_spec: EngineSpec,
     ) -> SignalFrame:
@@ -684,6 +866,9 @@ class BollingerAdapter(StrategyAdapter):
         index: pd.DatetimeIndex,
         bank: Dict[str, Dict[str, np.ndarray]],
         bars_close: Dict[str, np.ndarray],
+        bars_high: Dict[str, np.ndarray],
+        bars_low: Dict[str, np.ndarray],
+        bars_vol: Dict[str, np.ndarray],
         params: Dict[str, Any],
         base_spec: EngineSpec,
     ) -> SignalFrame:
@@ -736,6 +921,238 @@ class BollingerAdapter(StrategyAdapter):
             meta={"adapter": "bollinger", "bb_window": w, "bb_k": k, "allow_short": allow_short, "nan_policy": nan_policy},
         )
 
+class OBVAdapter(StrategyAdapter):
+    def __init__(self):
+        super().__init__(kind="obv")
+
+    def required_bank(self, base_spec: EngineSpec, active_params: list[ParamDef]) -> BankRequest:
+        req = BankRequest()
+        span0 = int(base_spec.strategy.params.get("obv_span", 20))
+        req.obv_ema.add(span0)
+        req.obv_ema |= set(_domain_values_int(active_params, "strategy.obv_span"))
+        return req
+
+    def make_signals_from_bank(
+        self,
+        symbols: List[str],
+        index: pd.DatetimeIndex,
+        bank: Dict[str, Dict[str, np.ndarray]],
+        bars_close: Dict[str, np.ndarray],
+        bars_high: Dict[str, np.ndarray],
+        bars_low: Dict[str, np.ndarray],
+        bars_vol: Dict[str, np.ndarray],
+        params: Dict[str, Any],
+        base_spec: EngineSpec,
+    ) -> SignalFrame:
+        sym = symbols[0]
+        span = int(params.get("strategy.obv_span", base_spec.strategy.params.get("obv_span", 20)))
+        allow_short = bool(params.get("strategy.allow_short", base_spec.strategy.params.get("allow_short", False)))
+        nan_policy = str(params.get("strategy.nan_policy", base_spec.strategy.params.get("nan_policy", "flat")))
+
+        obv = bank[sym]["obv"]
+        obv_ema = bank[sym][f"obv_ema_{span}"]
+
+        valid = np.isfinite(obv) & np.isfinite(obv_ema)
+        sig = np.zeros_like(obv, dtype=np.float64)
+
+        sig[obv > obv_ema] = 1.0
+        if allow_short:
+            sig[obv < obv_ema] = -1.0
+        else:
+            sig[obv < obv_ema] = -1.0  # exit intent
+
+        if nan_policy == "flat":
+            sig = np.where(valid, sig, 0.0)
+        else:
+            sig = np.where(valid, sig, np.nan)
+
+        return SignalFrame(
+            signals=pd.DataFrame({sym: sig}, index=index),
+            validity=pd.DataFrame({sym: valid.astype(bool)}, index=index),
+            meta={"adapter": "obv", "obv_span": span, "allow_short": allow_short, "nan_policy": nan_policy},
+        )
+
+
+class StochVWAPAdapter(StrategyAdapter):
+    def __init__(self):
+        super().__init__(kind="stoch_vwap")
+
+    def required_bank(self, base_spec: EngineSpec, active_params: list[ParamDef]) -> BankRequest:
+        req = BankRequest()
+
+        k0 = int(base_spec.strategy.params.get("k_window", 14))
+        d0 = int(base_spec.strategy.params.get("d_window", 3))
+        s0 = int(base_spec.strategy.params.get("smooth_k", 1))
+        v0 = int(base_spec.strategy.params.get("vwap_window", 20))
+
+        req.stoch.add((k0, d0, s0))
+        req.vwap.add(v0)
+
+        # domains
+        ks = set(_domain_values_int(active_params, "strategy.k_window"))
+        ds = set(_domain_values_int(active_params, "strategy.d_window"))
+        ss = set(_domain_values_int(active_params, "strategy.smooth_k"))
+        vs = set(_domain_values_int(active_params, "strategy.vwap_window"))
+
+        # If any domain missing, keep at least base values
+        if not ks: ks = {k0}
+        if not ds: ds = {d0}
+        if not ss: ss = {s0}
+
+        for k in ks:
+            for d in ds:
+                for s in ss:
+                    req.stoch.add((int(k), int(d), int(s)))
+
+        req.vwap |= {int(x) for x in (vs if vs else {v0})}
+        return req
+
+    @staticmethod
+    def _cross_up(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        return (a[:-1] <= b[:-1]) & (a[1:] > b[1:])
+
+    @staticmethod
+    def _cross_down(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        return (a[:-1] >= b[:-1]) & (a[1:] < b[1:])
+
+    def make_signals_from_bank(
+        self,
+        symbols: List[str],
+        index: pd.DatetimeIndex,
+        bank: Dict[str, Dict[str, np.ndarray]],
+        bars_close: Dict[str, np.ndarray],
+        bars_high: Dict[str, np.ndarray],
+        bars_low: Dict[str, np.ndarray],
+        bars_vol: Dict[str, np.ndarray],
+        params: Dict[str, Any],
+        base_spec: EngineSpec,
+    ) -> SignalFrame:
+        sym = symbols[0]
+
+        k_w = int(params.get("strategy.k_window", base_spec.strategy.params.get("k_window", 14)))
+        d_w = int(params.get("strategy.d_window", base_spec.strategy.params.get("d_window", 3)))
+        s_k = int(params.get("strategy.smooth_k", base_spec.strategy.params.get("smooth_k", 1)))
+        v_w = int(params.get("strategy.vwap_window", base_spec.strategy.params.get("vwap_window", 20)))
+
+        allow_short = bool(params.get("strategy.allow_short", base_spec.strategy.params.get("allow_short", False)))
+        nan_policy = str(params.get("strategy.nan_policy", base_spec.strategy.params.get("nan_policy", "flat")))
+
+        key = f"stoch_{k_w}_{d_w}_{s_k}"
+        k = bank[sym][f"{key}__k"]
+        d = bank[sym][f"{key}__d"]
+        vwap = bank[sym][f"vwap_{v_w}"]
+        close = bars_close[sym]
+
+        valid = np.isfinite(k) & np.isfinite(d) & np.isfinite(vwap) & np.isfinite(close)
+
+        # cross arrays are length n-1; align by putting False at t=0
+        n = close.size
+        kx_up = np.zeros(n, dtype=bool)
+        kx_dn = np.zeros(n, dtype=bool)
+        cx_up = np.zeros(n, dtype=bool)
+        cx_dn = np.zeros(n, dtype=bool)
+        kx_up[1:] = self._cross_up(k, d)
+        kx_dn[1:] = self._cross_down(k, d)
+        cx_up[1:] = self._cross_up(close, vwap)
+        cx_dn[1:] = self._cross_down(close, vwap)
+
+        buy1 = kx_up & (k < 20) & (d < 20) & (close > vwap)
+        buy2 = (k > 50) & (k < 80) & (d > 50) & (d < 80) & cx_up
+        buy3 = kx_up & (k < 80) & (d < 80) & (close > vwap)
+        buy = buy1 | buy2 | buy3
+
+        sell1 = kx_dn & (k > 80) & (d > 80) & (close < vwap)
+        sell2 = (k > 20) & (k < 50) & (d > 20) & (d < 50) & cx_dn
+        sell3 = kx_dn & (k > 20) & (d > 20) & (close < vwap)
+        sell = sell1 | sell2 | sell3
+
+        sig = np.zeros(n, dtype=np.float64)
+        sig[buy] = 1.0
+        # precedence: SELL overrides
+        sig[sell] = -1.0
+
+        if nan_policy == "flat":
+            sig = np.where(valid, sig, 0.0)
+        else:
+            sig = np.where(valid, sig, np.nan)
+
+        return SignalFrame(
+            signals=pd.DataFrame({sym: sig}, index=index),
+            validity=pd.DataFrame({sym: valid.astype(bool)}, index=index),
+            meta={
+                "adapter": "stoch_vwap",
+                "k_window": k_w, "d_window": d_w, "smooth_k": s_k, "vwap_window": v_w,
+                "allow_short": allow_short, "nan_policy": nan_policy,
+            },
+        )
+class IchimokuAdapter(StrategyAdapter):
+    def __init__(self):
+        super().__init__(kind="ichimoku")
+
+    def required_bank(self, base_spec: EngineSpec, active_params: list[ParamDef]) -> BankRequest:
+        req = BankRequest()
+        ten = int(base_spec.strategy.params.get("tenkan", 9))
+        kij = int(base_spec.strategy.params.get("kijun", 26))
+        sb  = int(base_spec.strategy.params.get("senkou_b", 52))
+        sh  = int(base_spec.strategy.params.get("shift", 26))
+
+        req.ichimoku.add((ten, kij, sb, sh))
+
+        # If you decide later to optimize these windows, you can extend domains here.
+        return req
+
+    def make_signals_from_bank(
+        self,
+        symbols: List[str],
+        index: pd.DatetimeIndex,
+        bank: Dict[str, Dict[str, np.ndarray]],
+        bars_close: Dict[str, np.ndarray],
+        bars_high: Dict[str, np.ndarray],
+        bars_low: Dict[str, np.ndarray],
+        bars_vol: Dict[str, np.ndarray],
+        params: Dict[str, Any],
+        base_spec: EngineSpec,
+    ) -> SignalFrame:
+        sym = symbols[0]
+
+        ten = int(params.get("strategy.tenkan", base_spec.strategy.params.get("tenkan", 9)))
+        kij = int(params.get("strategy.kijun", base_spec.strategy.params.get("kijun", 26)))
+        sb  = int(params.get("strategy.senkou_b", base_spec.strategy.params.get("senkou_b", 52)))
+        sh  = int(params.get("strategy.shift", base_spec.strategy.params.get("shift", 26)))
+
+        allow_short = bool(params.get("strategy.allow_short", base_spec.strategy.params.get("allow_short", False)))
+        nan_policy = str(params.get("strategy.nan_policy", base_spec.strategy.params.get("nan_policy", "flat")))
+
+        key = f"ichimoku_{ten}_{kij}_{sb}_{sh}"
+        tenkan = bank[sym][f"{key}__tenkan"]
+        kijun  = bank[sym][f"{key}__kijun"]
+        span_a = bank[sym][f"{key}__span_a"]
+        span_b = bank[sym][f"{key}__span_b"]
+        close  = bars_close[sym]
+
+        cloud_top = np.maximum(span_a, span_b)
+        cloud_bot = np.minimum(span_a, span_b)
+
+        valid = np.isfinite(close) & np.isfinite(tenkan) & np.isfinite(kijun) & np.isfinite(cloud_top) & np.isfinite(cloud_bot)
+
+        buy  = (close > cloud_top) & (tenkan > kijun)
+        sell = (close < cloud_bot) & (tenkan < kijun)
+
+        sig = np.zeros(close.size, dtype=np.float64)
+        sig[buy] = 1.0
+        sig[sell] = -1.0
+
+        if nan_policy == "flat":
+            sig = np.where(valid, sig, 0.0)
+        else:
+            sig = np.where(valid, sig, np.nan)
+
+        return SignalFrame(
+            signals=pd.DataFrame({sym: sig}, index=index),
+            validity=pd.DataFrame({sym: valid.astype(bool)}, index=index),
+            meta={"adapter": "ichimoku", "tenkan": ten, "kijun": kij, "senkou_b": sb, "shift": sh,
+                  "allow_short": allow_short, "nan_policy": nan_policy},
+        )
 
 
 STRATEGY_ADAPTERS: Dict[str, StrategyAdapter] = {
@@ -744,7 +1161,11 @@ STRATEGY_ADAPTERS: Dict[str, StrategyAdapter] = {
     "rsi": RSIStrategyAdapter(),
     "macd": MACDStrategyAdapter(),
     "bollinger": BollingerAdapter(),
+    "obv": OBVAdapter(),
+    "stoch_vwap": StochVWAPAdapter(),
+    "ichimoku": IchimokuAdapter(),
 }
+
 
 
 # ============================================================
@@ -775,6 +1196,23 @@ def default_param_catalog(strategy_kind: str) -> Dict[str, ParamDef]:
     elif strategy_kind == "bollinger":
         cat["strategy.bb_window"] = ParamDef("strategy.bb_window", "int", (10, 100, 1), int)
         cat["strategy.bb_k"] = ParamDef("strategy.bb_k", "float", (2.0, 5.0, 0.5), float)
+    
+    elif strategy_kind == "obv":
+        cat["strategy.obv_span"] = ParamDef("strategy.obv_span", "int", (5, 200, 1), int)
+
+    elif strategy_kind == "stoch_vwap":
+        cat["strategy.k_window"] = ParamDef("strategy.k_window", "int", (5, 60, 1), int)
+        cat["strategy.d_window"] = ParamDef("strategy.d_window", "int", (2, 20, 1), int)
+        cat["strategy.smooth_k"] = ParamDef("strategy.smooth_k", "int", (1, 10, 1), int)
+        cat["strategy.vwap_window"] = ParamDef("strategy.vwap_window", "int", (5, 100, 1), int)
+
+    elif strategy_kind == "ichimoku":
+        # baseline fixed: keep disabled by default (optimize won't vary them)
+        cat["strategy.tenkan"] = ParamDef("strategy.tenkan", "int", [9], int, enabled=False)
+        cat["strategy.kijun"] = ParamDef("strategy.kijun", "int", [26], int, enabled=False)
+        cat["strategy.senkou_b"] = ParamDef("strategy.senkou_b", "int", [52], int, enabled=False)
+        cat["strategy.shift"] = ParamDef("strategy.shift", "int", [26], int, enabled=False)
+
        
     # portfolio knobs you mentioned
     cat["portfolio.cooldown_bars"] = ParamDef("portfolio.cooldown_bars", "int", (0, 30, 1), int)
@@ -856,13 +1294,20 @@ def run_optimization(
     bars_open: Dict[str, np.ndarray] = {}
     bars_close: Dict[str, np.ndarray] = {}
     bars_vol: Dict[str, np.ndarray] = {}
+    bars_high: Dict[str, np.ndarray] = {}
+    bars_low: Dict[str, np.ndarray] = {}
+
     need_volume = bool(base_spec.portfolio.use_participation_cap or base_spec.portfolio.use_volume_gate)
+    need_volume_for_strategy = base_spec.strategy.kind.lower() in ("obv", "stoch_vwap")  # obv needs vol; stoch_vwap needs vol for vwap proxy
+    need_volume = bool(need_volume or need_volume_for_strategy)
     adv_by_window_np: Dict[int, Dict[str, np.ndarray]] = {}
 
     for s in symbols:
         b = md.bars[s].reindex(common_index)  # aligned already; reindex ok & explicit
         bars_open[s] = b["Open"].to_numpy(dtype=np.float64, copy=False)
         bars_close[s] = b["Close"].to_numpy(dtype=np.float64, copy=False)
+        bars_high[s] = b["High"].to_numpy(dtype=np.float64, copy=False)
+        bars_low[s] = b["Low"].to_numpy(dtype=np.float64, copy=False)
         if need_volume:
             vcol = base_spec.portfolio.volume_col
             if vcol not in b.columns:
@@ -871,7 +1316,7 @@ def run_optimization(
             
     # 3) Precompute arrays once (ALWAYS) + SMA bank (IF NEEDED)
     req = adapter.required_bank(base_spec, active_params)
-    bank = build_bank(bars_close, req)
+    bank = build_bank(bars_close, bars_high, bars_low, bars_vol, req)
         
     if need_volume:
         adv_windows: List[int] = []
@@ -932,6 +1377,8 @@ def run_optimization(
             bank=bank,
             bars_open=bars_open,      # NEW
             bars_close=bars_close,
+            bars_high=bars_high,
+            bars_low=bars_low,
             bars_vol=bars_vol,
             adv_by_window_np=adv_by_window_np,
             adapter=adapter,
@@ -970,6 +1417,9 @@ def run_optimization(
                 index=common_index,
                 bank=bank,
                 bars_close=bars_close,
+                bars_high=bars_high,
+                bars_low=bars_low,
+                bars_vol=bars_vol,
                 params=row_params,
             )
             sig_dates.append(d)
@@ -1012,6 +1462,9 @@ def run_optimization(
             index=common_index,
             bank=bank,
             bars_close=bars_close,
+            bars_high=bars_high,
+            bars_low=bars_low,
+            bars_vol=bars_vol,
             params=row_params,
         )
         sig_dates.append(d)
@@ -1068,6 +1521,9 @@ def eval_stats_only_for_spec_arrays(
 
     open_px  = b["Open"].to_numpy(dtype=np.float64, copy=False)
     close_px = b["Close"].to_numpy(dtype=np.float64, copy=False)
+    bars_high = {sym: b["High"].to_numpy(dtype=np.float64, copy=False)}
+    bars_low = {sym: b["Low"].to_numpy(dtype=np.float64, copy=False)}
+    bars_vol = {sym: b[spec.portfolio.volume_col].to_numpy(dtype=np.float64, copy=False)} if spec.portfolio.use_participation_cap or spec.portfolio.use_volume_gate else {}
 
     # NEW: volume/ADV support (so volume gate & participation cap work)
     need_volume = bool(spec.portfolio.use_participation_cap or spec.portfolio.use_volume_gate)
@@ -1154,13 +1610,16 @@ def eval_stats_only_for_spec_arrays(
 
     bars_close = {sym: close_px}
     req = adapter.required_bank(spec, active_params=[])  # spec-only: no domain
-    bank = build_bank(bars_close, req)
+    bank = build_bank(bars_close, bars_high, bars_low, bars_vol, req)
 
     sf = adapter.make_signals_from_bank(
         symbols=[sym],
         index=b.index,   # already sliced window
         bank=bank,
         bars_close=bars_close,
+        bars_high=bars_high,
+        bars_low=bars_low,
+        bars_vol=bars_vol,
         params={},       # no overrides, spec.params only
         base_spec=spec,
     )
@@ -1333,6 +1792,8 @@ def _eval_one_trial(
     common_index: pd.DatetimeIndex,
     bank: Dict[str, Dict[str, np.ndarray]],
     bars_open: Dict[str, np.ndarray],
+    bars_high: Dict[str, np.ndarray],
+    bars_low: Dict[str, np.ndarray],
     bars_close: Dict[str, np.ndarray],
     bars_vol: Dict[str, np.ndarray],
     adv_by_window_np: Dict[int, Dict[str, np.ndarray]],
@@ -1349,6 +1810,9 @@ def _eval_one_trial(
                 common_index=common_index,
                 bank=bank,
                 bars_close=bars_close,
+                bars_high=bars_high,
+                bars_low=bars_low,
+                bars_vol=bars_vol,
                 adapter=adapter,
                 params=params,
             )
@@ -1375,6 +1839,8 @@ def _eval_one_trial(
         open_px = bars_open[sym] if idx_pos is None else bars_open[sym][idx_pos]
         close_px = bars_close[sym] if idx_pos is None else bars_close[sym][idx_pos]
         need_volume = bool(base_spec.portfolio.use_participation_cap or base_spec.portfolio.use_volume_gate)
+        need_volume_for_strategy = base_spec.strategy.kind.lower() in ("obv", "stoch_vwap")  # obv needs vol; stoch_vwap needs vol for vwap proxy
+        need_volume = bool(need_volume or need_volume_for_strategy)
         vol_px = (bars_vol[sym] if idx_pos is None else bars_vol[sym][idx_pos]) if need_volume else None
         adv_cap_px = None
         adv_gate_px = None
@@ -1404,6 +1870,9 @@ def _eval_one_trial(
         # B) Build signals using adapter (single source of truth)
         # ----------------------------
         bars_close_trial = {sym: close_px}
+        bars_high_trial = {sym: bars_high[sym] if idx_pos is None else bars_high[sym][idx_pos]}
+        bars_low_trial = {sym: bars_low[sym] if idx_pos is None else bars_low[sym][idx_pos]}
+        bars_vol_trial = {sym: bars_vol[sym] if idx_pos is None else bars_vol[sym][idx_pos]} if need_volume else {}
 
         # If you slice idx_pos, the precomputed bank arrays must also be sliced.
         # Easiest: build a "view" bank for this sym using slicing.
@@ -1416,6 +1885,9 @@ def _eval_one_trial(
             index=(common_index if idx_pos is None else common_index[idx_pos]),
             bank={sym: sym_bank},
             bars_close=bars_close_trial,
+            bars_high=bars_high_trial,
+            bars_low=bars_low_trial,
+            bars_vol=bars_vol_trial,
             params=params,
             base_spec=base_spec,
         )
@@ -1583,11 +2055,36 @@ def _apply_params_to_spec(base_spec: EngineSpec, params: Dict[str, Any]) -> Engi
         sp["macd_slow_window"] = int(params["strategy.macd_slow_window"])
     if "strategy.macd_signal_window" in params:
         sp["macd_signal_window"] = int(params["strategy.macd_signal_window"])
+        # --- OBV ---
+    if "strategy.obv_span" in params:
+        sp["obv_span"] = int(params["strategy.obv_span"])
+
+    # --- Stoch+VWAP ---
+    if "strategy.k_window" in params:
+        sp["k_window"] = int(params["strategy.k_window"])
+    if "strategy.d_window" in params:
+        sp["d_window"] = int(params["strategy.d_window"])
+    if "strategy.smooth_k" in params:
+        sp["smooth_k"] = int(params["strategy.smooth_k"])
+    if "strategy.vwap_window" in params:
+        sp["vwap_window"] = int(params["strategy.vwap_window"])
+
+    # --- Ichimoku ---
+    if "strategy.tenkan" in params:
+        sp["tenkan"] = int(params["strategy.tenkan"])
+    if "strategy.kijun" in params:
+        sp["kijun"] = int(params["strategy.kijun"])
+    if "strategy.senkou_b" in params:
+        sp["senkou_b"] = int(params["strategy.senkou_b"])
+    if "strategy.shift" in params:
+        sp["shift"] = int(params["strategy.shift"])
+
     if "strategy.allow_short" in params:
         sp["allow_short"] = bool(params["strategy.allow_short"])
     if "strategy.nan_policy" in params:
         sp["nan_policy"] = str(params["strategy.nan_policy"])
     strat_cfg = replace(strat_cfg, params=sp)
+
 
     # PortfolioConfig
     port_cfg = _apply_portfolio_params(base_spec.portfolio, params)

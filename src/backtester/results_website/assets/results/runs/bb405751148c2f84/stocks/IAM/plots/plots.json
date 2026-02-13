@@ -1,0 +1,32 @@
+{
+  "plots": [
+    {
+      "file": "bollinger_price_panel.html",
+      "label": "bollinger price panel"
+    },
+    {
+      "file": "ichimoku_price_panel.html",
+      "label": "ichimoku price panel"
+    },
+    {
+      "file": "macd_price_panel.html",
+      "label": "macd price panel"
+    },
+    {
+      "file": "obv_price_panel.html",
+      "label": "obv price panel"
+    },
+    {
+      "file": "rsi_price_panel.html",
+      "label": "rsi price panel"
+    },
+    {
+      "file": "sma_price_price_panel.html",
+      "label": "sma price price panel"
+    },
+    {
+      "file": "stoch_vwap_price_panel.html",
+      "label": "stoch vwap price panel"
+    }
+  ]
+}

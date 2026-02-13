@@ -1,0 +1,12 @@
+{
+  "plots": [
+    {
+      "file": "bollinger_price_panel.html",
+      "label": "bollinger price panel"
+    },
+    {
+      "file": "rsi_price_panel.html",
+      "label": "rsi price panel"
+    }
+  ]
+}

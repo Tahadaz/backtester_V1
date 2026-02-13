@@ -810,10 +810,15 @@ class BollingerBandsStrategy(BaseStrategy):
 # Helpers for engine/UI: plot overlay indicators per strategy
 # =============================================================================
 
+from typing import Any, Dict, List
+
 def default_plot_indicators(cfg_kind: str, cfg_params: Dict[str, Any]) -> List[str]:
     k = (cfg_kind or "").lower()
     p = cfg_params or {}
 
+    # -------------------------
+    # Existing strategies
+    # -------------------------
     if k == "ma_cross":
         fast = int(p.get("sma_fast_window", p.get("fast_window", 20)))
         slow = int(p.get("sma_slow_window", p.get("slow_window", 50)))
@@ -832,11 +837,315 @@ def default_plot_indicators(cfg_kind: str, cfg_params: Dict[str, Any]) -> List[s
         slow = int(p.get("macd_slow_window", p.get("slow", 26)))
         sig  = int(p.get("macd_signal_window", p.get("signal", 9)))
         base = f"macd_{fast}_{slow}_{sig}"
-        return [f"{base}__line", f"{base}__signal"]
+        # include hist too if you compute it
+        return [f"{base}__line", f"{base}__signal", f"{base}__hist"]
 
     if k == "bollinger":
         w = int(p.get("bb_window", 20))
         return [f"sma_{w}", f"std_{w}"]
 
+    # -------------------------
+    # NEW strategies
+    # -------------------------
+
+    # === OBV ===
+    # Indicators expected by your plot:
+    #   "obv", "obv_ema_{span}"
+    if k == "obv":
+        span = int(p.get("obv_span", p.get("span", 20)))
+        return ["obv", f"obv_ema_{span}"]
+
+    # === Stoch + VWAP ===
+    # Indicators expected by your plot:
+    #   stoch_{k}_{d}_{smooth}__k
+    #   stoch_{k}_{d}_{smooth}__d
+    # and optionally vwap_{window} on price row
+    if k in ("stoch_vwap", "stoch", "stochastic"):
+        k_w = int(p.get("k_window", 14))
+        d_w = int(p.get("d_window", 3))
+        s_k = int(p.get("smooth_k", 1))
+        v_w = int(p.get("vwap_window", 20))
+
+        base = f"stoch_{k_w}_{d_w}_{s_k}"
+        return [f"{base}__k", f"{base}__d", f"vwap_{v_w}"]
+
+    # === Ichimoku ===
+    # Indicators expected by your plot:
+    #   ichimoku_{ten}_{kij}_{sb}_{shift}__tenkan/kijun/span_a/span_b
+    if k == "ichimoku":
+        ten = int(p.get("tenkan", 9))
+        kij = int(p.get("kijun", 26))
+        sb  = int(p.get("senkou_b", 52))
+        sh  = int(p.get("shift", 26))
+
+        base = f"ichimoku_{ten}_{kij}_{sb}_{sh}"
+        return [
+            f"{base}__tenkan",
+            f"{base}__kijun",
+            f"{base}__span_a",
+            f"{base}__span_b",
+        ]
+
     return []
 
+@dataclass(frozen=True)
+class OBVParams:
+    obv_span: int = 20
+    allow_short: bool = False
+    nan_policy: str = "flat"  # "flat" or "nan"
+
+class OBVStrategy(BaseStrategy):
+    def __init__(self, params: OBVParams) -> None:
+        self.params = params
+        self._obv_col = "obv"
+        # EMA is computed on Close in your current registry,
+        # so we will compute EMA(OBV) ourselves in strategy (institutionally: keep indicator pure).
+        # To keep everything in indicator engine, we instead compute a dedicated EMA on OBV by reusing pandas here.
+        self._ema_span = int(params.obv_span)
+
+    @property
+    def spec(self) -> StrategySpec:
+        return StrategySpec(name="OBVStrategy", params=asdict(self.params))
+
+    def required_features(self) -> List[FeatureSpec]:
+        return [
+            FeatureSpec(indicator="obv", params={}, inputs=("Close", "Volume"), warmup=2),
+        ]
+
+    def generate_signals(self, market_data: MarketDataLike, features_data: FeaturesDataLike,
+                         symbols: Optional[Sequence[str]] = None) -> SignalFrame:
+        symbols = list(symbols) if symbols is not None else list(market_data.bars.keys())
+
+        # union index (consistent with your other strategies)
+        common_index = market_data.bars[symbols[0]].index
+        for s in symbols[1:]:
+            common_index = common_index.union(market_data.bars[s].index)
+        common_index = common_index.sort_values()
+
+        sig_df = pd.DataFrame(index=common_index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=common_index, columns=symbols, dtype="bool")
+
+        for s in symbols:
+            obv = features_data.features[s][self._obv_col].reindex(common_index).astype(float)
+            obv_ema = obv.ewm(span=self._ema_span, adjust=False, min_periods=self._ema_span).mean()
+
+            valid = obv.notna() & obv_ema.notna()
+            signal = pd.Series(0.0, index=common_index, dtype=float)
+
+            signal[obv > obv_ema] = 1.0
+            if self.params.allow_short:
+                signal[obv < obv_ema] = -1.0
+            else:
+                # long/flat: exit when condition fails
+                signal[obv < obv_ema] = -1.0  # “sell/exit intent”, PortfolioEngine will reduce exposure
+
+            if self.params.nan_policy == "flat":
+                signal = signal.where(valid, 0.0)
+            else:
+                signal = signal.where(valid, np.nan)
+
+            sig_df[s] = signal
+            valid_df[s] = valid
+
+        return SignalFrame(
+            signals=sig_df,
+            validity=valid_df,
+            meta={"strategy_signature": self.spec.signature(), "note": "OBV vs EMA(OBV)"}
+        )
+
+@dataclass(frozen=True)
+class StochVWAPParams:
+    k_window: int = 14
+    d_window: int = 3
+    smooth_k: int = 1
+    vwap_window: int = 20
+    allow_short: bool = False
+    nan_policy: str = "flat"  # "flat" or "nan"
+class StochVWAPStrategy(BaseStrategy):
+    def __init__(self, params: StochVWAPParams) -> None:
+        self.params = params
+        self._stoch_base = f"stoch_{params.k_window}_{params.d_window}_{params.smooth_k}"
+        self._k_col = f"{self._stoch_base}__k"
+        self._d_col = f"{self._stoch_base}__d"
+        self._vwap_col = f"vwap_{params.vwap_window}"
+
+    @property
+    def spec(self) -> StrategySpec:
+        return StrategySpec(name="StochVWAPStrategy", params=asdict(self.params))
+
+    def required_features(self) -> List[FeatureSpec]:
+        warm = int(max(self.params.k_window, self.params.d_window, self.params.smooth_k, self.params.vwap_window) + 1)
+        return [
+            FeatureSpec(
+                indicator="stoch",
+                params={"k_window": self.params.k_window, "d_window": self.params.d_window, "smooth_k": self.params.smooth_k},
+                inputs=("High", "Low", "Close"),
+                warmup=warm,
+            ),
+            FeatureSpec(
+                indicator="vwap",
+                params={"window": self.params.vwap_window},
+                inputs=("High", "Low", "Close", "Volume"),
+                warmup=self.params.vwap_window,
+            ),
+        ]
+
+    @staticmethod
+    def _cross_up(a: pd.Series, b: pd.Series) -> pd.Series:
+        return (a.shift(1) <= b.shift(1)) & (a > b)
+
+    @staticmethod
+    def _cross_down(a: pd.Series, b: pd.Series) -> pd.Series:
+        return (a.shift(1) >= b.shift(1)) & (a < b)
+
+    def generate_signals(self, market_data: MarketDataLike, features_data: FeaturesDataLike,
+                         symbols: Optional[Sequence[str]] = None) -> SignalFrame:
+        symbols = list(symbols) if symbols is not None else list(market_data.bars.keys())
+
+        common_index = market_data.bars[symbols[0]].index
+        for s in symbols[1:]:
+            common_index = common_index.union(market_data.bars[s].index)
+        common_index = common_index.sort_values()
+
+        sig_df = pd.DataFrame(index=common_index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=common_index, columns=symbols, dtype="bool")
+
+        for s in symbols:
+            bars = market_data.bars[s].reindex(common_index)
+            close = bars["Close"].astype(float)
+
+            feats = features_data.features[s].reindex(common_index)
+            k = feats[self._k_col].astype(float)
+            d = feats[self._d_col].astype(float)
+            vwap = feats[self._vwap_col].astype(float)
+
+            valid = k.notna() & d.notna() & vwap.notna() & close.notna()
+
+            kx_up = self._cross_up(k, d)
+            kx_dn = self._cross_down(k, d)
+            cx_up = self._cross_up(close, vwap)
+            cx_dn = self._cross_down(close, vwap)
+
+            # BUY conditions
+            buy1 = kx_up & (k < 20) & (d < 20) & (close > vwap)
+            buy2 = (k > 50) & (k < 80) & (d > 50) & (d < 80) & cx_up
+            buy3 = kx_up & (k < 80) & (d < 80) & (close > vwap)
+            buy = buy1 | buy2 | buy3
+
+            # SELL conditions
+            sell1 = kx_dn & (k > 80) & (d > 80) & (close < vwap)
+            sell2 = (k > 20) & (k < 50) & (d > 20) & (d < 50) & cx_dn
+            sell3 = kx_dn & (k > 20) & (d > 20) & (close < vwap)
+            sell = sell1 | sell2 | sell3
+
+            # Precedence: SELL > BUY
+            signal = pd.Series(0.0, index=common_index, dtype=float)
+            signal[buy] = 1.0
+            if self.params.allow_short:
+                signal[sell] = -1.0
+            else:
+                # still emit -1 as “exit intent”
+                signal[sell] = -1.0
+
+            if self.params.nan_policy == "flat":
+                signal = signal.where(valid, 0.0)
+            else:
+                signal = signal.where(valid, np.nan)
+
+            sig_df[s] = signal
+            valid_df[s] = valid
+
+        return SignalFrame(
+            signals=sig_df,
+            validity=valid_df,
+            meta={"strategy_signature": self.spec.signature(), "note": "Stoch+VWAP 3-condition logic (sell precedence)"}
+        )
+
+
+@dataclass(frozen=True)
+class IchimokuParams:
+    tenkan: int = 9
+    kijun: int = 26
+    senkou_b: int = 52
+    shift: int = 26
+    allow_short: bool = False
+    nan_policy: str = "flat"  # "flat" or "nan"
+class IchimokuStrategy(BaseStrategy):
+    def __init__(self, params: IchimokuParams) -> None:
+        self.params = params
+        self._base = f"ichimoku_{params.tenkan}_{params.kijun}_{params.senkou_b}_{params.shift}"
+        self._tenkan = f"{self._base}__tenkan"
+        self._kijun = f"{self._base}__kijun"
+        self._span_a = f"{self._base}__span_a"
+        self._span_b = f"{self._base}__span_b"
+
+    @property
+    def spec(self) -> StrategySpec:
+        return StrategySpec(name="IchimokuStrategy", params=asdict(self.params))
+
+    def required_features(self) -> List[FeatureSpec]:
+        warm = int(self.params.senkou_b + self.params.shift)  # conservative
+        return [
+            FeatureSpec(
+                indicator="ichimoku",
+                params={
+                    "tenkan": self.params.tenkan,
+                    "kijun": self.params.kijun,
+                    "senkou_b": self.params.senkou_b,
+                    "shift": self.params.shift,
+                },
+                inputs=("High", "Low", "Close"),
+                warmup=warm,
+            )
+        ]
+
+    def generate_signals(self, market_data: MarketDataLike, features_data: FeaturesDataLike,
+                         symbols: Optional[Sequence[str]] = None) -> SignalFrame:
+        symbols = list(symbols) if symbols is not None else list(market_data.bars.keys())
+
+        common_index = market_data.bars[symbols[0]].index
+        for s in symbols[1:]:
+            common_index = common_index.union(market_data.bars[s].index)
+        common_index = common_index.sort_values()
+
+        sig_df = pd.DataFrame(index=common_index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=common_index, columns=symbols, dtype="bool")
+
+        for s in symbols:
+            bars = market_data.bars[s].reindex(common_index)
+            close = bars["Close"].astype(float)
+
+            feats = features_data.features[s].reindex(common_index)
+            tenkan = feats[self._tenkan].astype(float)
+            kijun = feats[self._kijun].astype(float)
+            span_a = feats[self._span_a].astype(float)
+            span_b = feats[self._span_b].astype(float)
+
+            cloud_top = pd.concat([span_a, span_b], axis=1).max(axis=1)
+            cloud_bot = pd.concat([span_a, span_b], axis=1).min(axis=1)
+
+            valid = close.notna() & tenkan.notna() & kijun.notna() & cloud_top.notna() & cloud_bot.notna()
+
+            buy = (close > cloud_top) & (tenkan > kijun)
+            sell = (close < cloud_bot) & (tenkan < kijun)
+
+            signal = pd.Series(0.0, index=common_index, dtype=float)
+            signal[buy] = 1.0
+            if self.params.allow_short:
+                signal[sell] = -1.0
+            else:
+                signal[sell] = -1.0  # exit intent
+
+            if self.params.nan_policy == "flat":
+                signal = signal.where(valid, 0.0)
+            else:
+                signal = signal.where(valid, np.nan)
+
+            sig_df[s] = signal
+            valid_df[s] = valid
+
+        return SignalFrame(
+            signals=sig_df,
+            validity=valid_df,
+            meta={"strategy_signature": self.spec.signature(), "note": "Kumo breakout + Tenkan/Kijun confirmation"}
+        )

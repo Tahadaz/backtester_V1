@@ -160,18 +160,24 @@ class ResultsAnalyzer:
         # trades payload (fills)
         init_cash = float(portfolio_result.meta.get("config", {}).get("initial_cash", 0.0))
         sym0 = symbols[0]
+        # -------------------------
+        # Fills: keep RAW + DISPLAY
+        # -------------------------
+        raw_fills = portfolio_result.trades  # canonical: timestamp,symbol,qty,price,cost,...
+
         trades = self._prepare_trades_table(
-            portfolio_result.trades,
+            raw_fills,
             initial_cash=init_cash,
-            mark_price=px,   # Close series aligned on equity index
+            mark_price=px,
         )
 
+        # Compute artifacts MUST use raw_fills (not the prettified table)
+        trade_ledger = self._trade_ledger_from_fills(raw_fills)
+        trade_perf   = self._trade_performance_summary(trade_ledger)
 
-        trade_ledger = self._trade_ledger_from_fills(trades)
-        trade_perf = self._trade_performance_summary(trade_ledger)
+        volume_inv   = self._volume_invested_reset_last_sell_monthly(raw_fills)
+        round_trips  = self._round_trips_from_fills(raw_fills)
 
-        # --- efficiency denominator: monthly-reset net invested volume ---
-        volume_inv = self._volume_invested_reset_last_sell_monthly(trades)
         pnl_total = float(equity.iloc[-1] - equity.iloc[0]) if len(equity) else 0.0
         efficiency = 1.0 if volume_inv <= 0 else float(pnl_total / volume_inv)
         # --- benchmark series (optional) ---
@@ -487,20 +493,14 @@ class ResultsAnalyzer:
         - Fees are deducted from realized PnL when closing/reducing (pro-rated on flips).
         - Latent PnL marked to `mark_price` at trade timestamp when provided, else uses execution price.
         """
-        base_cols = [
-            "timestamp", "symbol", "qty", "side", "price", "notional", "cost",
-            "commission_ht", "vat", "slippage",
-            "signed_notional", "net_invested", "cash_after",
-        ]
+
 
         if trades is None or trades.empty:
             out_cols = [
-                "side", "trade_date", "quantity", "price", "fees",
+                "side", "price", "fees",
                 "available_quantity", "cmp", "position_value_cost",
                 "pnl_realise", "pnl_latent",
-            ] + base_cols + [
-                "month_net_invested", "is_last_sell_in_month", "month_volumeinv_at_last_sell", "month"
-            ]
+            ]   
             # remove dupes while preserving order
             seen = set()
             out_cols = [c for c in out_cols if not (c in seen or seen.add(c))]
@@ -521,11 +521,13 @@ class ResultsAnalyzer:
         df["side"] = df["side"].astype(str).str.upper()
 
         # cost
+                # cost (ensure exists)
         if "cost" not in df.columns:
             df["cost"] = 0.0
-        df["cost"] = df["cost"].fillna(0.0).astype(float)
+        df["cost"] = pd.to_numeric(df["cost"], errors="coerce").fillna(0.0).astype(float)
 
-        # notional (absolute)
+
+        # notional (absolute)   
         if "notional" not in df.columns:
             df["notional"] = (df["qty"].abs() * df["price"]).astype(float)
 
@@ -534,18 +536,12 @@ class ResultsAnalyzer:
 
         keep = [c for c in [
             "timestamp", "symbol", "qty", "side", "price", "notional", "cost",
-            "commission_ht", "vat", "slippage",
-            "signed_notional",
         ] if c in df.columns]
         df = df[keep].sort_values(["timestamp", "symbol"]).reset_index(drop=True)
 
         # account-level running net invested + cash path (same as your current)
-        df["net_invested"] = df["signed_notional"].cumsum()
-        df["cash_after"] = float(initial_cash) + (-df["signed_notional"] - df["cost"]).cumsum()
 
         # requested aliases
-        df["trade_date"] = df["timestamp"]
-        df["quantity"] = df["qty"].abs().astype(float)
         df["fees"] = df["cost"].astype(float)
 
         # mark price
@@ -635,36 +631,91 @@ class ResultsAnalyzer:
                 else:
                     df.at[i, "pnl_latent"] = float(abs(pos) * (cmp_ - mark))
 
-        # -------------------------------
-        # KEEP your Monthly VolumeInv reset markers (unchanged)
-        # -------------------------------
-        df["_month"] = df["timestamp"].dt.to_period("M")
-        df["month_net_invested"] = df.groupby("_month")["signed_notional"].cumsum()
-
-        sell_mask = df["side"].astype(str).str.upper().eq("SELL")
-        last_sell_ts = (
-            df.loc[sell_mask]
-            .groupby("_month")["timestamp"]
-            .max()
-        )
-        df["is_last_sell_in_month"] = df["_month"].map(last_sell_ts).eq(df["timestamp"])
-        df["month_volumeinv_at_last_sell"] = np.where(df["is_last_sell_in_month"], df["month_net_invested"], np.nan)
-        df["month"] = df["_month"].astype(str)
-        df = df.drop(columns=["_month"])
+        
 
         # final order: requested columns first (plus keep fills columns)
-        display_cols = [
-            "side", "trade_date", "quantity", "price", "fees",
-            "available_quantity", "cmp", "position_value_cost",
-            "pnl_realise", "pnl_latent",
-        ]
-        audit_cols = [c for c in df.columns if c not in display_cols]
-        df = df[display_cols + audit_cols]
 
+        # ============================================================
+        # FINAL PRESENTATION: rename, de-duplicate, and reorder columns
+        # ============================================================
+
+        # 1) Rename columns for display (French labels)
+        #    NOTE: pandas supports any string column names; just be consistent downstream.
+        rename_map = {
+            "price": "prix d'éxécution (open du jour)",
+            "_mark": "close du jour",
+            "cmp": "cmp",
+            "pnl_realise": "pnl realisé",
+            "pnl_latent": "pnl latent",
+            "qty": "quantité",
+        }
+        for k in list(rename_map.keys()):
+            if k not in df.columns:
+                rename_map.pop(k, None)
+        df = df.rename(columns=rename_map)
+
+        # 2) Remove redundant columns
+        # You currently have both:
+        # - "cost" (total fees you computed in engine)
+        # - "fees" (alias of cost)
+        # Keep ONE. Here: keep "cost" and drop "fees".
+        drop_if_exists = [
+            "fees",          # duplicated with cost
+            "trade_date",    # duplicated with timestamp (unless you want both)
+            "quantity",      # duplicated with qty.abs() (unless you prefer quantity over qty)
+            "notional",
+            "commission_ht", # drop components
+            "vat",
+            "slippage",      # you said you don't have it, but harmless if present
+            "trade_date",    # duplicate of timestamp
+        ]
+        drop_if_exists = [c for c in drop_if_exists if c in df.columns]
+        df = df.drop(columns=drop_if_exists)
+
+        # Optional: if you prefer "quantity" instead of signed "qty"
+        # uncomment:
+        # df["quantity"] = df["qty"].abs().astype(float)
+        # df = df.drop(columns=["qty"])
+        # and then include "quantity" in the display order below.
+
+        # 3) Build a “front” layout (human-friendly)
+        front = [
+            "timestamp",
+            "symbol",
+            "side",
+            "prix d'éxécution (open du jour)",
+            "quantité",  # signed quantity (keep); or use "quantity" if you switch as noted above
+            "cmp",
+            "pnl realisé",
+            "pnl latent",
+            "close du jour",
+            "available_quantity",
+            "position_value_cost",
+            "cost",  # total fees
+        ]
+
+
+        # 4) Keep the rest (audit fields) after, without duplicates
+        #    Also preserve any columns that exist but aren’t listed in `front`.
+        existing_front = [c for c in front if c in df.columns]
+        audit_preferred = [
+                    "notional",
+                    "signed_notional",
+                    "net_invested",
+                    "cash_after",
+                ]
+
+        audit_preferred = [c for c in audit_preferred if c in df.columns and c not in existing_front]
+
+        used = set(existing_front + audit_preferred)
+        rest = [c for c in df.columns if c not in used]
+
+        df = df[existing_front + audit_preferred + rest]
         return df
 
 
 
+    
     def _volume_invested_reset_last_sell_monthly(self, fills: pd.DataFrame) -> float:
         """Compute VolumeInv with a monthly reset at the *last* SELL of each month.
 
@@ -754,6 +805,12 @@ class ResultsAnalyzer:
             ])
 
         df = fills.copy()
+
+        if "qty" not in df.columns and "quantité" in df.columns:
+            df["qty"] = pd.to_numeric(df["quantité"], errors="coerce")
+        if "price" not in df.columns and "prix d'éxécution (open du jour)" in df.columns:
+            df["price"] = pd.to_numeric(df["prix d'éxécution (open du jour)"], errors="coerce")
+
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df = df.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
 
@@ -1031,32 +1088,42 @@ class ResultsAnalyzer:
         gross_pnl, entry_cost, exit_cost, net_pnl,
         return_pct, hold_days
         """
+        base_cols = [
+            "entry_time", "exit_time", "symbol", "side", "qty",
+            "entry_price", "exit_price",
+            "gross_pnl", "entry_cost", "exit_cost", "net_pnl",
+            "return_pct", "hold_days",
+        ]
+
         if fills is None or fills.empty:
-            return pd.DataFrame(
-                columns=[
-                    "entry_time", "exit_time", "symbol", "side", "qty",
-                    "entry_price", "exit_price",
-                    "gross_pnl", "entry_cost", "exit_cost", "net_pnl",
-                    "return_pct", "hold_days",
-                ]
-            )
+            return pd.DataFrame(columns=base_cols)
 
         f = fills.copy()
 
+        # Accept prettified column names too (from _prepare_trades_table)
+        if "qty" not in f.columns and "quantité" in f.columns:
+            f["qty"] = pd.to_numeric(f["quantité"], errors="coerce")
+        if "price" not in f.columns and "prix d'éxécution (open du jour)" in f.columns:
+            f["price"] = pd.to_numeric(f["prix d'éxécution (open du jour)"], errors="coerce")
+
         # Normalize
+        if "timestamp" not in f.columns or "symbol" not in f.columns:
+            return pd.DataFrame(columns=base_cols)
+
         f["timestamp"] = pd.to_datetime(f["timestamp"], errors="coerce")
         f = f.dropna(subset=["timestamp"]).sort_values(["timestamp", "symbol"]).reset_index(drop=True)
 
         for c in ["qty", "price", "cost"]:
             if c in f.columns:
                 f[c] = pd.to_numeric(f[c], errors="coerce")
+
         f = f.dropna(subset=["qty", "price"])
         if "cost" not in f.columns:
             f["cost"] = 0.0
-        f["cost"] = f["cost"].fillna(0.0)
+        f["cost"] = f["cost"].fillna(0.0).astype(float)
 
         # FIFO lots per symbol
-        # lot: qty_signed, price, time, entry_cost_total
+        # lot: qty_signed (float), price (float), time, entry_cost_total (float)
         lots: dict[str, list[dict]] = {}
         out_rows: list[dict] = []
 
@@ -1064,43 +1131,37 @@ class ResultsAnalyzer:
             ts = row["timestamp"]
             sym = str(row["symbol"])
             qty = float(row["qty"])
-            if qty == 0:
+            if qty == 0.0:
                 continue
 
             price = float(row["price"])
-            cost_total = float(row["cost"])
-
-            if qty == 0:
-                continue
+            fill_cost_total = float(row["cost"])
 
             if sym not in lots:
                 lots[sym] = []
 
-            # Allocate exit/entry cost pro-rata if a fill both closes and opens (flip)
             fill_abs = abs(qty)
-            fill_cost_total = cost_total
 
-            # Helper: allocate cost proportional to a used quantity from this fill
-            def alloc_fill_cost(used_abs_qty: int) -> float:
-                if fill_abs == 0:
+            # Allocate fill cost proportional to the portion of this fill used
+            def alloc_fill_cost(used_abs_qty: float) -> float:
+                if fill_abs <= 0:
                     return 0.0
                 return fill_cost_total * (float(used_abs_qty) / float(fill_abs))
 
-            remaining_qty = qty  # signed
+            remaining_qty = qty  # signed float
 
-            # If there are open lots with opposite sign, we are closing them
-            while remaining_qty != 0 and lots[sym]:
+            # Close opposite-direction lots FIFO
+            while remaining_qty != 0.0 and lots[sym]:
                 lot = lots[sym][0]
                 lot_qty = float(lot["qty"])
-                if lot_qty == 0:
+                if lot_qty == 0.0:
                     lots[sym].pop(0)
                     continue
 
-                # Same direction -> stop closing; this fill is opening/increasing
+                # Same direction -> stop closing; remaining opens/increases
                 if np.sign(lot_qty) == np.sign(remaining_qty):
                     break
 
-                # Opposite direction -> close
                 close_abs = min(abs(remaining_qty), abs(lot_qty))
 
                 side = "LONG" if lot_qty > 0 else "SHORT"
@@ -1113,11 +1174,11 @@ class ResultsAnalyzer:
                 else:
                     gross = close_abs * (entry_price - exit_price)
 
-                # Allocate entry cost from lot pro-rata
+                # Entry cost pro-rata from lot
                 lot_abs_before = abs(lot_qty)
-                entry_cost_part = float(lot["entry_cost"]) * (float(close_abs) / float(lot_abs_before))
+                entry_cost_part = float(lot["entry_cost"]) * (close_abs / lot_abs_before) if lot_abs_before > 0 else 0.0
 
-                # Allocate exit cost from this fill pro-rata
+                # Exit cost pro-rata from this fill
                 exit_cost_part = alloc_fill_cost(close_abs)
 
                 net = gross - entry_cost_part - exit_cost_part
@@ -1132,26 +1193,25 @@ class ResultsAnalyzer:
                         "exit_time": ts,
                         "symbol": sym,
                         "side": side,
-                        "qty": int(close_abs),
+                        "qty": float(close_abs),
                         "entry_price": entry_price,
                         "exit_price": exit_price,
                         "gross_pnl": float(gross),
                         "entry_cost": float(entry_cost_part),
                         "exit_cost": float(exit_cost_part),
                         "net_pnl": float(net),
-                        "return_pct": float(ret_pct),
+                        "return_pct": float(ret_pct) if np.isfinite(ret_pct) else np.nan,
                         "hold_days": int(hold_days),
                     }
                 )
 
-                # Reduce lot and remaining fill qty
-                # Update lot qty toward zero
+                # Reduce lot qty toward zero
                 if lot_qty > 0:
                     lot["qty"] = lot_qty - close_abs
                 else:
                     lot["qty"] = lot_qty + close_abs
 
-                # Reduce lot entry cost proportionally
+                # Reduce lot entry cost by the portion consumed
                 lot["entry_cost"] = float(lot["entry_cost"]) - float(entry_cost_part)
 
                 # Reduce remaining fill qty toward zero
@@ -1160,25 +1220,26 @@ class ResultsAnalyzer:
                 else:
                     remaining_qty += close_abs
 
-                # Remove depleted lots
-                if int(lot["qty"]) == 0:
+                # Drop depleted lot
+                if abs(float(lot["qty"])) < 1e-12:
                     lots[sym].pop(0)
 
-            # Any remaining_qty opens a new lot (or increases same direction)
-            if remaining_qty != 0:
+            # Any remaining opens a new lot
+            if remaining_qty != 0.0:
                 open_abs = abs(remaining_qty)
                 entry_cost_for_open = alloc_fill_cost(open_abs)
-
                 lots[sym].append(
                     {
                         "timestamp": ts,
-                        "qty": int(remaining_qty),
+                        "qty": float(remaining_qty),
                         "price": float(price),
                         "entry_cost": float(entry_cost_for_open),
                     }
                 )
 
-        ledger = pd.DataFrame(out_rows)
+        # IMPORTANT: force schema even if no rows => prevents KeyError on merges
+        ledger = pd.DataFrame(out_rows, columns=base_cols)
+
         # --- Optional audit columns from fills (sell clamp debugging) ---
         audit_cols = [
             "avg_entry_price_before",
@@ -1188,13 +1249,14 @@ class ResultsAnalyzer:
             "sell_clamp_reason",
         ]
         avail = [c for c in audit_cols if c in f.columns]
-        if avail:
+
+        # Only merge audits if we actually have closed trades (ledger non-empty)
+        if avail and not ledger.empty:
             ff = f.copy()
             ff["side"] = ff.get("side", np.where(ff["qty"] > 0, "BUY", "SELL"))
             ff["side"] = ff["side"].astype(str).str.upper()
             sells = ff[ff["side"] == "SELL"][["timestamp", "symbol"] + avail].copy()
             sells = sells.rename(columns={"timestamp": "exit_time"})
-            # join on exit_time+symbol (works if your fills timestamps match)
             ledger = ledger.merge(sells, on=["exit_time", "symbol"], how="left")
 
         if ledger.empty:
@@ -1202,6 +1264,7 @@ class ResultsAnalyzer:
 
         ledger = ledger.sort_values(["exit_time", "symbol"]).reset_index(drop=True)
         return ledger
+
     def _trade_performance_summary(self, ledger: pd.DataFrame) -> pd.DataFrame:
         if ledger is None or ledger.empty:
             return pd.DataFrame(index=[

@@ -866,8 +866,8 @@ async function loadAndRenderLedger(strategyKey) {
     return;
   }
 
-  // Construct ledger path: assets/results/stocks/{ticker}/ledgers/{strategy}_trade_ledger.csv
-  const url = `${stockRoot(ACTIVE_TICKER)}/ledgers/${strategyKey}_trade_ledger.csv`;
+  // Construct ledger path: assets/results/stocks/{ticker}/ledgers/{strategy}_trades.csv
+  const url = `${stockRoot(ACTIVE_TICKER)}/ledgers/${strategyKey}_trades.csv`;
 
   console.log(`Attempting to load ledger from: ${url}`); // Debug log
 
